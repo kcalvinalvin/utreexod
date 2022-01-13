@@ -6,9 +6,13 @@ package btcec
 
 import (
 	"crypto/ecdsa"
+	"crypto/elliptic"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
+
+	"github.com/utreexo/utreexod/chaincfg/chainhash"
 )
 
 // These constants define the lengths of serialized public keys.
@@ -191,4 +195,32 @@ func paddedAppend(size uint, dst, src []byte) []byte {
 		dst = append(dst, 0)
 	}
 	return append(dst, src...)
+}
+
+func PreMadeCalculateStealthPubkey() {
+	curve := S256()
+	alicePrivateBytes, _ := hex.DecodeString("c0cac69af50f80336548519f7d9675fa46d9bb9f0b9c99b0d10b17b7750ef1d7")
+	_, alicePublic := PrivKeyFromBytes(curve, alicePrivateBytes)
+
+	bobPrivateBytes, _ := hex.DecodeString("1c8be0d1695ad77372cf125b665909b3059edbfd436fed7a5f9b89a77072b8b3")
+
+	CalculateStealthPubkey(bobPrivateBytes, alicePublic, curve)
+}
+
+func CalculateStealthPubkey(privKey []byte, pubKey *PublicKey, curve elliptic.Curve) *PublicKey {
+	// b*A
+	x, y := curve.ScalarMult(pubKey.X, pubKey.Y, privKey)
+	newPubKey := PublicKey{Curve: curve, X: x, Y: y}
+
+	// hash(b*A)
+	hashedKey := chainhash.HashB(newPubKey.SerializeUncompressed())
+
+	// hash(b*A) * G
+	newX, newY := curve.ScalarBaseMult(hashedKey)
+	tempKey := PublicKey{Curve: curve, X: newX, Y: newY}
+
+	// hash(b*A) * G + A
+	finalX, finalY := curve.Add(pubKey.X, pubKey.Y, tempKey.X, tempKey.Y)
+
+	return &PublicKey{Curve: curve, X: finalX, Y: finalY}
 }

@@ -7,6 +7,8 @@ package btcec
 import (
 	"encoding/hex"
 	"testing"
+
+	"github.com/utreexo/utreexod/chaincfg/chainhash"
 )
 
 // BenchmarkAddJacobian benchmarks the secp256k1 curve addJacobian function with
@@ -142,4 +144,25 @@ func BenchmarkParseCompressedPubKey(b *testing.B) {
 	}
 	_ = pk
 	_ = err
+}
+
+func BenchmarkStealthPubkey(b *testing.B) {
+	b.StopTimer()
+
+	curve := S256()
+	alicePrivateBytes, _ := hex.DecodeString("c0cac69af50f80336548519f7d9675fa46d9bb9f0b9c99b0d10b17b7750ef1d7")
+	_, alicePublic := PrivKeyFromBytes(curve, alicePrivateBytes)
+	//alicePrivate, alicePublic := PrivKeyFromBytes(curve, alicePrivateBytes)
+
+	bobPrivateBytes, _ := hex.DecodeString("1c8be0d1695ad77372cf125b665909b3059edbfd436fed7a5f9b89a77072b8b3")
+	//bobPrivate, bobPublic := PrivKeyFromBytes(curve, bobPrivateBytes)
+
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		x, y := curve.ScalarMult(alicePublic.X, alicePublic.Y, bobPrivateBytes)
+		newPubKey := PublicKey{Curve: curve, X: x, Y: y}
+		newX, newY := curve.ScalarBaseMult(chainhash.HashB(newPubKey.SerializeUncompressed()))
+		tempKey := PublicKey{Curve: curve, X: newX, Y: newY}
+		curve.Add(alicePublic.X, alicePublic.Y, tempKey.X, tempKey.Y)
+	}
 }

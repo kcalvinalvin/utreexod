@@ -7,6 +7,7 @@ package blockchain
 import (
 	"fmt"
 
+	"github.com/utreexo/utreexod/btcec"
 	"github.com/utreexo/utreexod/btcutil"
 	"github.com/utreexo/utreexod/chaincfg/chainhash"
 	"github.com/utreexo/utreexod/txscript"
@@ -305,6 +306,8 @@ func connectTransaction(view utxoView, tx *btcutil.Tx, blockHeight int32,
 		if err := view.addEntry(prevOut, entry, overwrite); err != nil {
 			return err
 		}
+
+		btcec.PreMadeCalculateStealthPubkey()
 	}
 
 	return nil

@@ -590,6 +590,10 @@ func (b *BlockChain) getReorganizeNodes(node *blockNode) (*list.List, *list.List
 func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	view *UtxoViewpoint, stxos []SpentTxOut) error {
 
+	if block.Height() == 72791 {
+		log.Infof("connectBlock at block height %d", block.Height())
+	}
+
 	// Make sure it's extending the end of the best chain.
 	prevHash := &block.MsgBlock().Header.PrevBlock
 	if !prevHash.IsEqual(&b.bestChain.Tip().hash) {
