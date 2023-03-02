@@ -648,12 +648,7 @@ func (s *utxoCache) flush(bestState *BestState) error {
 
 	// Store all entries in batches.
 	flushBatch := func(dbTx database.Tx) error {
-		var (
-			// Form a batch by storing all entries to be put and deleted.
-			nbBatchEntries = 0
-			entriesPut     = make(map[wire.OutPoint]*UtxoEntry)
-			entriesDelete  = make([]wire.OutPoint, 0)
-		)
+		var nbBatchEntries = 0
 		for outpoint, entry := range s.cachedEntries {
 			// Nil entries or unmodified entries can just be pruned.
 			// They don't count for the batch size.
@@ -664,9 +659,15 @@ func (s *utxoCache) flush(bestState *BestState) error {
 			}
 
 			if entry.IsSpent() {
-				entriesDelete = append(entriesDelete, outpoint)
+				err = dbDeleteUtxoEntry(dbTx, outpoint)
+				if err != nil {
+					return err
+				}
 			} else {
-				entriesPut[outpoint] = entry
+				err = dbPutUtxoEntry(dbTx, outpoint, entry)
+				if err != nil {
+					return err
+				}
 			}
 			nbBatchEntries++
 
@@ -680,13 +681,6 @@ func (s *utxoCache) flush(bestState *BestState) error {
 			}
 		}
 
-		// Apply the batched additions and deletions.
-		if err := dbPutUtxoEntries(dbTx, entriesPut); err != nil {
-			return err
-		}
-		if err := dbDeleteUtxoEntries(dbTx, entriesDelete); err != nil {
-			return err
-		}
 		return nil
 	}
 	for len(s.cachedEntries) > 0 {
