@@ -3143,7 +3143,7 @@ func handleGetUtreexoProof(s *rpcServer, cmd interface{}, closeChan <-chan struc
 		return nil, err
 	}
 
-	serialized := bytes.NewBuffer(make([]byte, udata.SerializeSize()))
+	serialized := bytes.NewBuffer(make([]byte, 0, udata.SerializeSize()))
 	err = udata.Serialize(serialized)
 	if err != nil {
 		return nil, &btcjson.RPCError{
