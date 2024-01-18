@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/utreexo/utreexod/chaincfg"
@@ -9,7 +10,7 @@ import (
 
 func TestInvalidateAndReconsiderBlock(t *testing.T) {
 	// Set up regtest chain.
-	r, err := rpctest.New(&chaincfg.RegressionNetParams, nil, []string{"--noutreexo"}, "")
+	r, err := rpctest.New(&chaincfg.RegressionNetParams, nil, []string{"--flatutreexoproofindex", "--utreexoproofindex"}, "")
 	if err != nil {
 		t.Fatalf("TestInvalidateAndReconsiderBlock fail. Unable to create primary harness: %v", err)
 	}
@@ -33,11 +34,23 @@ func TestInvalidateAndReconsiderBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	roots, err := r.Client.GetUtreexoRoots(block4ActiveTipHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println(roots)
+
 	// Cache block 1 hash as this will be our chaintip after we invalidate block 2.
 	block1Hash, err := r.Client.GetBlockHash(1)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	roots, err = r.Client.GetUtreexoRoots(block1Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println(roots)
 
 	// Invalidate block 2.
 	//
@@ -60,6 +73,11 @@ func TestInvalidateAndReconsiderBlock(t *testing.T) {
 			"best block hash to be block 1 with hash %s but got %s",
 			block1Hash.String(), bestHash.String())
 	}
+	roots, err = r.Client.GetUtreexoRoots(bestHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println(roots)
 
 	// Generate 2 blocks.
 	//
