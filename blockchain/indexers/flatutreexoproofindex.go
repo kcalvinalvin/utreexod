@@ -88,6 +88,8 @@ type FlatUtreexoProofIndex struct {
 	rootsState       FlatFileState
 	chainParams      *chaincfg.Params
 
+	pruned bool
+
 	// The blockchain instance the index corresponds to.
 	chain *blockchain.BlockChain
 
@@ -205,6 +207,17 @@ func (idx *FlatUtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.
 	idx.pStats.UpdateTotalDelCount(uint64(len(dels)))
 	idx.pStats.UpdateUDStats(false, ud)
 
+	idx.pStats.BlockHeight = uint64(block.Height())
+	err = idx.pStats.WritePStats(&idx.proofStatsState)
+	if err != nil {
+		return err
+	}
+
+	// Don't store proofs if the node is pruned.
+	if idx.pruned {
+		return nil
+	}
+
 	// If the interval is 1, then just save the utreexo proof and we're done.
 	if idx.proofGenInterVal == 1 {
 		err = idx.storeProof(block.Height(), false, ud)
@@ -225,12 +238,6 @@ func (idx *FlatUtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.
 				return err
 			}
 		}
-	}
-
-	idx.pStats.BlockHeight = uint64(block.Height())
-	err = idx.pStats.WritePStats(&idx.proofStatsState)
-	if err != nil {
-		return err
 	}
 
 	return nil
@@ -592,27 +599,18 @@ func (idx *FlatUtreexoProofIndex) MakeMultiBlockProof(currentHeight, proveHeight
 func (idx *FlatUtreexoProofIndex) DisconnectBlock(dbTx database.Tx, block *btcutil.Block,
 	stxos []blockchain.SpentTxOut) error {
 
-	ud, err := idx.FetchUtreexoProof(block.Height(), false)
-	if err != nil {
-		return err
-	}
-
-	// Need to call reconstruct since the saved utreexo data is in the compact form.
-	delHashes, err := idx.chain.ReconstructUData(ud, *block.Hash())
-	if err != nil {
-		return err
-	}
-
-	_, outCount, _, outskip := blockchain.DedupeBlock(block)
-	adds := blockchain.BlockToAddLeaves(block, outskip, nil, outCount)
-
 	state, err := idx.fetchRoots(block.Height())
 	if err != nil {
 		return err
 	}
 
+	numAdds, targets, delHashes, err := idx.fetchUndoBlock(block.Height())
+	if err != nil {
+		return err
+	}
+
 	idx.mtx.Lock()
-	err = idx.utreexoState.state.Undo(uint64(len(adds)), utreexo.Proof{Targets: ud.AccProof.Targets}, delHashes, state.Roots)
+	err = idx.utreexoState.state.Undo(numAdds, utreexo.Proof{Targets: targets}, delHashes, state.Roots)
 	idx.mtx.Unlock()
 	if err != nil {
 		return err
@@ -1191,4 +1189,16 @@ func DropFlatUtreexoProofIndex(db database.DB, dataDir string, interrupt <-chan 
 
 	path := utreexoBasePath(&UtreexoConfig{DataDir: dataDir, Name: flatUtreexoProofIndexType})
 	return deleteUtreexoState(path)
+}
+
+// FlatUtreexoProofIndexInitialized returns true if the cfindex has been created previously.
+func FlatUtreexoProofIndexInitialized(db database.DB) bool {
+	var exists bool
+	db.View(func(dbTx database.Tx) error {
+		bucket := dbTx.Metadata().Bucket(flatUtreexoBucketKey)
+		exists = bucket != nil
+		return nil
+	})
+
+	return exists
 }

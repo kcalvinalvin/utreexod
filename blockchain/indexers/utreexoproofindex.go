@@ -37,6 +37,11 @@ var (
 	// utreexoStateKey is the name of the utreexo state data.  It is included
 	// in the utreexoParentBucketKey and contains the utreexo state data.
 	utreexoStateKey = []byte("utreexostatekey")
+
+	// utreexoUndoKey is the name of the utreexo undo data bucket. It is included
+	// in the utreexoParentBucketKey and contains the data necessary for disconnecting
+	// blocks.
+	utreexoUndoKey = []byte("utreexoundokey")
 )
 
 // Ensure the UtreexoProofIndex type implements the Indexer interface.
@@ -49,6 +54,9 @@ var _ NeedsInputser = (*UtreexoProofIndex)(nil)
 type UtreexoProofIndex struct {
 	db          database.DB
 	chainParams *chaincfg.Params
+
+	// If the node is a pruned node or not.
+	pruned bool
 
 	// The blockchain instance the index corresponds to.
 	chain *blockchain.BlockChain
@@ -142,9 +150,12 @@ func (idx *UtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Bloc
 		return err
 	}
 
-	err = dbStoreUtreexoProof(dbTx, block.Hash(), ud)
-	if err != nil {
-		return err
+	// Only store the proofs if the node is not pruned.
+	if !idx.pruned {
+		err = dbStoreUtreexoProof(dbTx, block.Hash(), ud)
+		if err != nil {
+			return err
+		}
 	}
 
 	err = dbStoreUtreexoState(dbTx, block.Hash(), idx.utreexoState.state)
@@ -155,6 +166,12 @@ func (idx *UtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Bloc
 	delHashes := make([]utreexo.Hash, len(ud.LeafDatas))
 	for i := range delHashes {
 		delHashes[i] = ud.LeafDatas[i].LeafHash()
+	}
+
+	err = dbStoreUndoData(dbTx,
+		uint64(len(adds)), ud.AccProof.Targets, block.Hash(), delHashes)
+	if err != nil {
+		return err
 	}
 
 	idx.mtx.Lock()
@@ -174,27 +191,18 @@ func (idx *UtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Bloc
 func (idx *UtreexoProofIndex) DisconnectBlock(dbTx database.Tx, block *btcutil.Block,
 	stxos []blockchain.SpentTxOut) error {
 
-	ud, err := idx.FetchUtreexoProof(block.Hash())
-	if err != nil {
-		return err
-	}
-
-	// Need to call reconstruct since the saved utreexo data is in the compact form.
-	delHashes, err := idx.chain.ReconstructUData(ud, *block.Hash())
-	if err != nil {
-		return err
-	}
-
 	state, err := dbFetchUtreexoState(dbTx, block.Hash())
 	if err != nil {
 		return err
 	}
 
-	_, outCount, _, outskip := blockchain.DedupeBlock(block)
-	adds := blockchain.BlockToAddLeaves(block, outskip, nil, outCount)
+	numAdds, targets, delHashes, err := dbFetchUndoData(dbTx, block.Hash())
+	if err != nil {
+		return err
+	}
 
 	idx.mtx.Lock()
-	err = idx.utreexoState.state.Undo(uint64(len(adds)), utreexo.Proof{Targets: ud.AccProof.Targets}, delHashes, state.Roots)
+	err = idx.utreexoState.state.Undo(numAdds, utreexo.Proof{Targets: targets}, delHashes, state.Roots)
 	idx.mtx.Unlock()
 	if err != nil {
 		return err
@@ -210,7 +218,7 @@ func (idx *UtreexoProofIndex) DisconnectBlock(dbTx database.Tx, block *btcutil.B
 		return err
 	}
 
-	return nil
+	return dbDeleteUndoData(dbTx, block.Hash())
 }
 
 // FetchUtreexoProof returns the Utreexo proof data for the given block hash.
@@ -375,15 +383,15 @@ func (idx *UtreexoProofIndex) SetChain(chain *blockchain.BlockChain) {
 //
 // This is part of the Indexer interface.
 func (idx *UtreexoProofIndex) PruneBlock(dbTx database.Tx, blockHash *chainhash.Hash) error {
-	err := dbDeleteUtreexoProofEntry(dbTx, blockHash)
-	if err != nil {
-		return err
-	}
+	//err := dbDeleteUtreexoProofEntry(dbTx, blockHash)
+	//if err != nil {
+	//	return err
+	//}
 
-	err = dbDeleteUtreexoState(dbTx, blockHash)
-	if err != nil {
-		return err
-	}
+	//err = dbDeleteUtreexoState(dbTx, blockHash)
+	//if err != nil {
+	//	return err
+	//}
 
 	return nil
 }
@@ -409,6 +417,7 @@ func NewUtreexoProofIndex(db database.DB, dataDir string, chainParams *chaincfg.
 		return nil, err
 	}
 	idx.utreexoState = uState
+	//idx.pruned = pruned
 
 	return idx, nil
 }
@@ -478,8 +487,44 @@ func dbFetchUtreexoState(dbTx database.Tx, hash *chainhash.Hash) (utreexo.Stump,
 	return utreexo.Stump{Roots: roots, NumLeaves: numLeaves}, nil
 }
 
+func dbStoreUndoData(dbTx database.Tx, numAdds uint64,
+	targets []uint64, blockHash *chainhash.Hash, delHashes []utreexo.Hash) error {
+
+	bytes, err := serializeUndoBlock(numAdds, targets, delHashes)
+	if err != nil {
+		return err
+	}
+
+	undoBucket := dbTx.Metadata().Bucket(utreexoParentBucketKey).Bucket(utreexoUndoKey)
+	return undoBucket.Put(blockHash[:], bytes)
+}
+
+func dbFetchUndoData(dbTx database.Tx, blockHash *chainhash.Hash) (uint64, []uint64, []utreexo.Hash, error) {
+	undoBucket := dbTx.Metadata().Bucket(utreexoParentBucketKey).Bucket(utreexoUndoKey)
+	bytes := undoBucket.Get(blockHash[:])
+
+	return deserializeUndoBlock(bytes)
+}
+
+func dbDeleteUndoData(dbTx database.Tx, blockHash *chainhash.Hash) error {
+	undoBucket := dbTx.Metadata().Bucket(utreexoParentBucketKey).Bucket(utreexoUndoKey)
+	return undoBucket.Delete(blockHash[:])
+}
+
 // Deletes the utreexo state in the database.
 func dbDeleteUtreexoState(dbTx database.Tx, hash *chainhash.Hash) error {
 	idx := dbTx.Metadata().Bucket(utreexoParentBucketKey).Bucket(utreexoStateKey)
 	return idx.Delete(hash[:])
+}
+
+// UtreexoProofIndexInitialized returns true if the cfindex has been created previously.
+func UtreexoProofIndexInitialized(db database.DB) bool {
+	var exists bool
+	db.View(func(dbTx database.Tx) error {
+		bucket := dbTx.Metadata().Bucket(utreexoParentBucketKey)
+		exists = bucket != nil
+		return nil
+	})
+
+	return exists
 }
