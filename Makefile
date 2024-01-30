@@ -16,3 +16,14 @@ build-utreexod: build-bdk ## Build utreexod with all features
 
 build-utreexod-without-bdk: ## Build utreexod without BDK wallet
 	go build
+
+test:
+	cargo test
+	sh ./goclean.sh
+
+all: build-bdk build-utreexod
+
+clean:
+	rm utreexod
+	go clean
+	cargo clean
