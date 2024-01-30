@@ -3577,6 +3577,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 			FlatUtreexoProofIndex: s.flatUtreexoProofIndex,
 			FeeEstimator:          s.feeEstimator,
 			WatchOnlyWallet:       s.watchOnlyWallet,
+			BDKWallet:             s.bdkWallet,
 		})
 		if err != nil {
 			return nil, err
