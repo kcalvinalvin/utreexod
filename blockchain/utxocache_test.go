@@ -662,11 +662,7 @@ func TestFlushNeededAfterPrune(t *testing.T) {
 
 	for _, test := range tests {
 		chain.utxoCache.lastFlushHash = test.lastFlushHash
-		got, err := chain.flushNeededAfterPrune(test.earliestKeptHeight)
-		if err != nil {
-			t.Fatal(err)
-		}
-
+		got := chain.flushNeededAfterPrune(test.earliestKeptHeight)
 		if got != test.expected {
 			t.Fatalf("for test %s, expected need flush to return %v but got %v",
 				test.name, test.expected, got)

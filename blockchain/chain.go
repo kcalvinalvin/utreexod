@@ -692,11 +692,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 				}
 			}
 			if b.utreexoView == nil {
-				flushNeeded, err := b.flushNeededAfterPrune(earliestKeptBlockHeight)
-				if err != nil {
-					return err
-				}
-
+				flushNeeded := b.flushNeededAfterPrune(earliestKeptBlockHeight)
 				if flushNeeded {
 					err = b.utxoCache.flush(dbTx, FlushRequired, state)
 					if err != nil {

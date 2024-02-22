@@ -716,14 +716,20 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 //
 // Example: if the last flush hash was at height 100 and one of the deleted blocks was at
 // height 98, this function will return true.
-func (b *BlockChain) flushNeededAfterPrune(earliestHeight int32) (bool, error) {
+func (b *BlockChain) flushNeededAfterPrune(earliestHeight int32) bool {
 	if earliestHeight < 0 {
-		return false, nil
+		return false
 	}
-	lastFlushHeight, err := b.BlockHeightByHash(&b.utxoCache.lastFlushHash)
-	if err != nil {
-		return false, err
+	node := b.index.LookupNode(&b.utxoCache.lastFlushHash)
+	if node == nil {
+		// If we couldn't find the node for when we flushed the
+		// utxocache last, then just force a flush and that will set the
+		// lastFlushHash again. This shouldn't happen though and a nil node
+		// is probably a hardware issue but there's nothing we can do about
+		// that here.
+		return true
 	}
+	lastFlushHeight := node.height
 
-	return earliestHeight > lastFlushHeight, nil
+	return earliestHeight > lastFlushHeight
 }
