@@ -6,6 +6,7 @@ package blockchain
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/utreexo/utreexod/database"
 	"github.com/utreexo/utreexod/txscript"
 	"github.com/utreexo/utreexod/wire"
+	"golang.org/x/crypto/ripemd160"
 )
 
 // UtreexoViewpoint is the compact state of the chainstate using the utreexo accumulator
@@ -377,21 +379,9 @@ func reconstructUData(ud *wire.UData, block *btcutil.Block, chainView *chainView
 			if ld.ReconstructablePkType != wire.OtherTy &&
 				ld.PkScript == nil {
 
-				var class txscript.ScriptClass
-
-				switch ld.ReconstructablePkType {
-				case wire.PubKeyHashTy:
-					class = txscript.PubKeyHashTy
-				case wire.ScriptHashTy:
-					class = txscript.ScriptHashTy
-				case wire.WitnessV0PubKeyHashTy:
-					class = txscript.WitnessV0PubKeyHashTy
-				case wire.WitnessV0ScriptHashTy:
-					class = txscript.WitnessV0ScriptHashTy
-				}
-
-				scriptToUse, err := txscript.ReconstructScript(
-					txIn.SignatureScript, txIn.Witness, class)
+				scriptToUse, err := ReconstructScript(
+					txIn.SignatureScript, txIn.Witness,
+					ld.ReconstructablePkType)
 				if err != nil {
 					return nil, err
 				}
@@ -489,6 +479,191 @@ func BlockToAddLeaves(block *btcutil.Block, skiplist []uint32, remembers []uint3
 	return leaves
 }
 
+// GetReconstructScriptType returns the script tye of the passed in pkscript and the sigscript.
+// It checks for reconstructability based on the following:
+// 1: the sigscript is of types p2pkh, p2sh, p2wpkh, or p2wsh.
+// 2: The last data push of the sigscript is the preimage of the pubkey hash or the script hash.
+func GetReconstructScriptType(sigScript, pkScript []byte, witness wire.TxWitness) (wire.PkType, error) {
+	class := txscript.GetScriptClass(pkScript)
+	switch class {
+	case txscript.PubKeyHashTy:
+		if len(sigScript) == 0 {
+			return wire.OtherTy,
+				fmt.Errorf("Have %v script but sigscript is %v", class.String(), sigScript)
+		}
+		script, err := ReconstructScript(sigScript, witness, wire.PubKeyHashTy)
+		if err != nil {
+			return wire.OtherTy, err
+		}
+		if !bytes.Equal(script, pkScript) {
+			log.Debugf("expected pkscript of %v but got %v",
+				hex.EncodeToString(pkScript),
+				hex.EncodeToString(script))
+			return wire.OtherTy, nil
+		}
+
+		return wire.PubKeyHashTy, nil
+
+	case txscript.ScriptHashTy:
+		if len(sigScript) == 0 {
+			return wire.OtherTy,
+				fmt.Errorf("Have %v script but sigscript is %v", class.String(), sigScript)
+		}
+		script, err := ReconstructScript(sigScript, witness, wire.ScriptHashTy)
+		if err != nil {
+			return wire.OtherTy, err
+		}
+		if !bytes.Equal(script, pkScript) {
+			log.Debugf("expected pkscript of %v but got %v",
+				hex.EncodeToString(pkScript),
+				hex.EncodeToString(script))
+			return wire.OtherTy, nil
+		}
+
+		return wire.ScriptHashTy, nil
+
+	case txscript.WitnessV0PubKeyHashTy:
+		if len(witness) == 0 {
+			return wire.OtherTy,
+				fmt.Errorf("Have %v script but witness is %v", class.String(), witness)
+		}
+		script, err := ReconstructScript(sigScript, witness, wire.WitnessV0PubKeyHashTy)
+		if err != nil {
+			return wire.OtherTy, err
+		}
+		if !bytes.Equal(script, pkScript) {
+			log.Debugf("expected pkscript of %v but got %v",
+				hex.EncodeToString(pkScript),
+				hex.EncodeToString(script))
+			return wire.OtherTy, nil
+		}
+
+		return wire.WitnessV0PubKeyHashTy, nil
+
+	case txscript.WitnessV0ScriptHashTy:
+		if len(witness) == 0 {
+			return wire.OtherTy,
+				fmt.Errorf("Have %v script but witness is %v", class.String(), witness)
+		}
+		script, err := ReconstructScript(sigScript, witness, wire.WitnessV0ScriptHashTy)
+		if err != nil {
+			return wire.OtherTy, err
+		}
+		if !bytes.Equal(script, pkScript) {
+			log.Debugf("expected pkscript of %v but got %v",
+				hex.EncodeToString(pkScript),
+				hex.EncodeToString(script))
+			return wire.OtherTy, nil
+		}
+
+		return wire.WitnessV0ScriptHashTy, nil
+	default:
+	}
+
+	return wire.OtherTy, nil
+}
+
+// ReconstructScript reconstructs the script from the witness for standard
+// transactions.  This function only works for p2pkh, p2wpkh, p2sh and p2wsh.
+// Only version 0 witness scripts are supported.  Returns nil for types that
+// are not supported
+func ReconstructScript(sigScript []byte, witness wire.TxWitness, ty wire.PkType) ([]byte, error) {
+	var script []byte
+	var err error
+
+	getLastData := func(bytes []byte) []byte {
+		var data []byte
+		tokenizer := txscript.MakeScriptTokenizer(0, bytes)
+		for tokenizer.Next() {
+			data = tokenizer.Data()
+		}
+
+		return data
+	}
+
+	// payToPubKeyHashScript creates a new script to pay a transaction
+	// output to a 20-byte pubkey hash. It is expected that the input is a valid
+	// hash.
+	payToPubKeyHashScript := func(pubKeyHash []byte) ([]byte, error) {
+		return txscript.NewScriptBuilder().AddOp(txscript.OP_DUP).AddOp(txscript.OP_HASH160).
+			AddData(pubKeyHash).AddOp(txscript.OP_EQUALVERIFY).AddOp(txscript.OP_CHECKSIG).
+			Script()
+	}
+
+	// payToWitnessPubKeyHashScript creates a new script to pay to a version 0
+	// pubkey hash witness program. The passed hash is expected to be valid.
+	payToWitnessPubKeyHashScript := func(pubKeyHash []byte) ([]byte, error) {
+		return txscript.NewScriptBuilder().AddOp(txscript.OP_0).AddData(pubKeyHash).Script()
+	}
+
+	// payToScriptHashScript creates a new script to pay a transaction output to a
+	// script hash. It is expected that the input is a valid hash.
+	payToScriptHashScript := func(scriptHash []byte) ([]byte, error) {
+		return txscript.NewScriptBuilder().AddOp(txscript.OP_HASH160).AddData(scriptHash).
+			AddOp(txscript.OP_EQUAL).Script()
+	}
+
+	// payToWitnessScriptHashScript creates a new script to pay to a version 0
+	// script hash witness program. The passed hash is expected to be valid.
+	payToWitnessScriptHashScript := func(scriptHash []byte) ([]byte, error) {
+		return txscript.NewScriptBuilder().AddOp(txscript.OP_0).AddData(scriptHash).Script()
+	}
+
+	// ripemd160h returns the RIPEMD160 hash of the given data.
+	ripemd160h := func(data []byte) []byte {
+		h := ripemd160.New()
+		h.Write(data)
+		return h.Sum(nil)
+	}
+
+	// hash160 returns the RIPEMD160 hash of the SHA-256 HASH of the given data.
+	hash160 := func(data []byte) []byte {
+		h := sha256.Sum256(data)
+		return ripemd160h(h[:])
+	}
+
+	switch ty {
+	case wire.PubKeyHashTy:
+		hash := btcutil.Hash160(getLastData(sigScript))
+		script, err = payToPubKeyHashScript(hash)
+		if err != nil {
+			return nil, err
+		}
+	case wire.ScriptHashTy:
+		hash := btcutil.Hash160(getLastData(sigScript))
+		script, err = payToScriptHashScript(hash)
+		if err != nil {
+			return nil, err
+		}
+	case wire.WitnessV0PubKeyHashTy:
+		if len(witness) == 0 {
+			return nil, fmt.Errorf("unable to reconstruct script due to missing witness: %v", witness)
+		}
+		last := witness[len(witness)-1]
+		hash := hash160(last)
+
+		script, err = payToWitnessPubKeyHashScript(hash)
+		if err != nil {
+			return nil, err
+		}
+	case wire.WitnessV0ScriptHashTy:
+		if len(witness) == 0 {
+			return nil, fmt.Errorf("unable to reconstruct script due to missing witness: %v", witness)
+		}
+		last := witness[len(witness)-1]
+		hash := chainhash.HashH(last)
+
+		script, err = payToWitnessScriptHashScript(hash[:])
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported scriptclass %v", ty.String())
+	}
+
+	return script, nil
+}
+
 // ExcludedUtxo is the utxo that was excluded because it was spent and created
 // within a given block interval.  It includes the creation height and the outpoint
 // of the utxo.
@@ -561,20 +736,12 @@ func BlockToDelLeaves(stxos []SpentTxOut, chain *BlockChain, block *btcutil.Bloc
 					stxo.Height)
 			}
 
-			var pkType wire.PkType
-
-			scriptType := txscript.GetScriptClass(stxo.PkScript)
-			switch scriptType {
-			case txscript.PubKeyHashTy:
-				pkType = wire.PubKeyHashTy
-			case txscript.WitnessV0PubKeyHashTy:
-				pkType = wire.WitnessV0PubKeyHashTy
-			case txscript.ScriptHashTy:
-				pkType = wire.ScriptHashTy
-			case txscript.WitnessV0ScriptHashTy:
-				pkType = wire.WitnessV0ScriptHashTy
-			default:
-				pkType = wire.OtherTy
+			pkType, err := GetReconstructScriptType(
+				txIn.SignatureScript,
+				stxo.PkScript,
+				txIn.Witness)
+			if err != nil {
+				return nil, nil, err
 			}
 
 			var leaf = wire.LeafData{
