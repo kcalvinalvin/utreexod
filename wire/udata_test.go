@@ -8,13 +8,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"math/rand"
-	"reflect"
 	"testing"
-	"testing/quick"
 
 	"github.com/utreexo/utreexo"
-	"github.com/utreexo/utreexod/chaincfg/chainhash"
 )
 
 type testData struct {
@@ -22,9 +18,8 @@ type testData struct {
 	height         int32
 	leavesPerBlock []LeafData
 
-	size             int
-	sizeCompact      int
-	sizeCompactNoAcc int
+	size        int
+	sizeCompact int
 }
 
 func getTestDatas() []testData {
@@ -58,9 +53,8 @@ var mainNetBlock104773 = testData{
 			IsCoinBase: false,
 		},
 	},
-	size:             217,
-	sizeCompact:      83,
-	sizeCompactNoAcc: 82,
+	size:        214,
+	sizeCompact: 80,
 }
 
 var testNetBlock383 = testData{
@@ -112,23 +106,15 @@ var testNetBlock383 = testData{
 			IsCoinBase: true,
 		},
 	},
-	size:             461,
-	sizeCompact:      193,
-	sizeCompactNoAcc: 192,
+	size:        456,
+	sizeCompact: 188,
 }
 
 func checkUDEqual(ud, checkUData *UData, isCompact bool, name string) error {
-	for i := range ud.AccProof.Targets {
-		if ud.AccProof.Targets[i] != checkUData.AccProof.Targets[i] {
+	for i := range ud.ProofHashes {
+		if ud.ProofHashes[i] != checkUData.ProofHashes[i] {
 			return fmt.Errorf("%s: UData.AccProof Target mismatch. expect %v, got %v",
-				name, ud.AccProof.Targets[i], checkUData.AccProof.Targets[i])
-		}
-	}
-
-	for i := range ud.AccProof.Proof {
-		if ud.AccProof.Proof[i] != checkUData.AccProof.Proof[i] {
-			return fmt.Errorf("%s: UData.AccProof Target mismatch. expect %v, got %v",
-				name, ud.AccProof.Proof[i], checkUData.AccProof.Proof[i])
+				name, ud.ProofHashes[i], checkUData.ProofHashes[i])
 		}
 	}
 
@@ -180,19 +166,69 @@ func checkUDEqual(ud, checkUData *UData, isCompact bool, name string) error {
 		}
 	}
 
-	if !isCompact {
-		if !reflect.DeepEqual(ud, checkUData) {
-			if !reflect.DeepEqual(ud.AccProof, checkUData.AccProof) {
-				return fmt.Errorf("ud and checkUData reflect.DeepEqual AccProof mismatch")
-			}
+	return nil
+}
 
-			if !reflect.DeepEqual(ud.LeafDatas, checkUData.LeafDatas) {
-				return fmt.Errorf("ud and checkUData reflect.DeepEqual LeafDatas mismatch")
-			}
+// HashesFromLeafDatas hashes the passed in leaf datas. Returns an error if a
+// leaf data is compact as you can't generate the correct hash.
+func HashesFromLeafDatas(leafDatas []LeafData) ([]utreexo.Hash, error) {
+	// make slice of hashes from leafdata
+	delHashes := make([]utreexo.Hash, 0, len(leafDatas))
+	for _, ld := range leafDatas {
+		// We can't calculate the correct hash if the leaf data is in
+		// the compact state.
+		if ld.IsCompact() {
+			return nil, fmt.Errorf("leafdata is compact. Unable " +
+				"to generate a leafhash")
 		}
+
+		delHashes = append(delHashes, ld.LeafHash())
 	}
 
-	return nil
+	return delHashes, nil
+}
+
+// generateUData creates a block proof, calling forest.ProveBatch with the leaf indexes
+// to get a batched inclusion proof from the accumulator. It then adds on the leaf data,
+// to create a block proof which both proves inclusion and gives all utxo data
+// needed for transaction verification.
+func generateUData(txIns []LeafData, pollard utreexo.Utreexo) (
+	*UData, error) {
+
+	ud := new(UData)
+	ud.LeafDatas = txIns
+
+	// Make a slice of hashes from the leafdatas.
+	delHashes, err := HashesFromLeafDatas(ud.LeafDatas)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate the utreexo accumulator proof for all the inputs.
+	proof, err := pollard.Prove(delHashes)
+	if err != nil {
+		// Find out which exact one is causing the error.
+		for i, delHash := range delHashes {
+			_, err = pollard.Prove([]utreexo.Hash{delHash})
+			if err != nil {
+				ld := ud.LeafDatas[i]
+				return nil,
+					fmt.Errorf("LeafData hash %s couldn't be proven. "+
+						"BlockHash %s, Outpoint %s, height %v, "+
+						"IsCoinbase %v, Amount %v, PkScript %s. "+
+						"err: %s",
+						hex.EncodeToString(delHash[:]),
+						ld.BlockHash.String(), ld.OutPoint.String(),
+						ld.Height, ld.IsCoinBase, ld.Amount,
+						hex.EncodeToString(ld.PkScript), err.Error())
+			}
+		}
+		return nil, err
+	}
+
+	ud.ProofHashes = proof.Proof
+
+	return ud, nil
 }
 
 func TestUDataSerializeSize(t *testing.T) {
@@ -229,18 +265,17 @@ func TestUDataSerializeSize(t *testing.T) {
 		}
 
 		// Generate Proof.
-		ud, err := GenerateUData(testData.leavesPerBlock, &p)
+		ud, err := generateUData(testData.leavesPerBlock, &p)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		// Append to the tests.
 		tests = append(tests, test{
-			name:             testData.name,
-			ud:               *ud,
-			size:             testData.size,
-			sizeCompact:      testData.sizeCompact,
-			sizeCompactNoAcc: testData.sizeCompactNoAcc,
+			name:        testData.name,
+			ud:          *ud,
+			size:        testData.size,
+			sizeCompact: testData.sizeCompact,
 		})
 	}
 
@@ -273,7 +308,6 @@ func TestUDataSerializeSize(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			fmt.Println("buf size", len(buf.Bytes()))
 
 			t.Errorf("%s: UData serialize size compact (false) fail. "+
 				"expect %d, got %d", test.name,
@@ -299,35 +333,6 @@ func TestUDataSerializeSize(t *testing.T) {
 		err = test.ud.SerializeCompact(&buf)
 		if err != nil {
 			t.Fatal(err)
-		}
-
-		gotSize = test.ud.SerializeSizeCompactNoAccProof()
-		if gotSize != test.sizeCompactNoAcc {
-			t.Errorf("%s: UData serialize size compact no accumulator proof fail. "+
-				"expect %d, got %d", test.name,
-				test.sizeCompactNoAcc, gotSize)
-			continue
-		}
-
-		// Sanity check.  Actually serialize the data and compare against our hardcoded number.
-		buf.Reset()
-		err = test.ud.SerializeCompactNoAccProof(&buf)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(buf.Bytes()) != test.sizeCompactNoAcc {
-			t.Errorf("%s: UData serialize size compact no accumulator proof fail. "+
-				"serialized %d, hardcoded %d", test.name,
-				len(buf.Bytes()), test.sizeCompactNoAcc)
-			continue
-		}
-
-		// Test that SerializeUxtoDataSizeCompact and SerializeUxtoDataSizeCompact
-		// sums up to the entire thing.
-		totals := test.ud.SerializeUxtoDataSizeCompact() + test.ud.SerializeAccSizeCompact()
-		if totals != test.ud.SerializeSizeCompact() {
-			t.Errorf("%s: expected %d for but got %d as the sum of utxodata, accumulator data, and the remember idxs",
-				test.name, test.ud.SerializeSizeCompact(), totals)
 		}
 	}
 }
@@ -363,7 +368,7 @@ func TestUDataSerialize(t *testing.T) {
 		}
 
 		// Generate Proof.
-		ud, err := GenerateUData(testData.leavesPerBlock, &p)
+		ud, err := generateUData(testData.leavesPerBlock, &p)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -434,7 +439,7 @@ func TestUDataSerializeCompact(t *testing.T) {
 		}
 
 		// Generate Proof.
-		ud, err := GenerateUData(testData.leavesPerBlock, &p)
+		ud, err := generateUData(testData.leavesPerBlock, &p)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -475,159 +480,5 @@ func TestUDataSerializeCompact(t *testing.T) {
 				"Before len %d, after len %d", test.name,
 				len(test.before), len(test.after))
 		}
-	}
-}
-
-func TestSerializeNoAccProof(t *testing.T) {
-	t.Parallel()
-
-	type test struct {
-		name      string
-		isForTx   bool
-		leafCount int
-		ud        UData
-		before    []byte
-		after     []byte
-	}
-
-	testDatas := getTestDatas()
-	tests := make([]test, 0, len(testDatas))
-
-	for _, testData := range testDatas {
-		// New forest object.
-		p := utreexo.NewAccumulator()
-
-		// Create hashes to add from the stxo data.
-		addHashes := make([]utreexo.Leaf, 0, len(testData.leavesPerBlock))
-		for i, ld := range testData.leavesPerBlock {
-			addHashes = append(addHashes, utreexo.Leaf{
-				Hash: ld.LeafHash(),
-				// Just half and half.
-				Remember: i%2 == 0,
-			})
-		}
-		// Add to the accumulator.
-		err := p.Modify(addHashes, nil, utreexo.Proof{})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Generate Proof.
-		ud, err := GenerateUData(testData.leavesPerBlock, &p)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Append to the tests.
-		tests = append(tests, test{
-			name:    testData.name,
-			isForTx: false,
-			ud:      *ud,
-		})
-	}
-
-	for _, test := range tests {
-		ud := test.ud
-		// Serialize
-		writer := &bytes.Buffer{}
-		err := ud.SerializeCompactNoAccProof(writer)
-		if err != nil {
-			t.Fatal(err)
-		}
-		test.before = writer.Bytes()
-
-		// Deserialize
-		checkUData := new(UData)
-		err = checkUData.DeserializeCompactNoAccProof(writer)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		err = checkUDEqual(&ud, checkUData, true, test.name)
-		if err != nil {
-			t.Error(err)
-		}
-
-		// Re-serialize
-		afterWriter := &bytes.Buffer{}
-		checkUData.SerializeCompactNoAccProof(afterWriter)
-		test.after = afterWriter.Bytes()
-
-		// Check if before and after match.
-		if !bytes.Equal(test.before, test.after) {
-			t.Errorf("%s: UData serialize/deserialize fail. "+
-				"Before len %d, after len %d", test.name,
-				len(test.before), len(test.after))
-		}
-	}
-}
-
-func TestGenerateUData(t *testing.T) {
-	t.Parallel()
-
-	// Creates 15 leaves
-	leafCount := 15
-
-	rand := rand.New(rand.NewSource(0))
-	leafDatas := make([]LeafData, leafCount)
-	for i := range leafDatas {
-		// This creates a txo thats not spendable but it's ok for accumulator
-		// testing.
-		leafVal, ok := quick.Value(reflect.TypeOf(LeafData{}), rand)
-		if !ok {
-			t.Fatal("Could not create LeafData")
-		}
-		ld := leafVal.Interface().(LeafData)
-
-		blockHashVal, ok := quick.Value(reflect.TypeOf(chainhash.Hash{}), rand)
-		if !ok {
-			t.Fatal("Could not create OutPoint")
-		}
-		bh := blockHashVal.Interface().(chainhash.Hash)
-		ld.BlockHash = bh
-		leafDatas[i] = ld
-	}
-
-	// Hash the leafData so that it can be added to the accumulator.
-	addLeaves := make([]utreexo.Leaf, leafCount)
-	for i := range addLeaves {
-		addLeaves[i] = utreexo.Leaf{
-			Hash: leafDatas[i].LeafHash(),
-		}
-	}
-
-	p := utreexo.NewAccumulator()
-	err := p.Modify(addLeaves, nil, utreexo.Proof{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	delCount := 2
-	firstDelIdx := 4
-	secondDelIdx := 10
-
-	delLeaves := make([]LeafData, delCount)
-	delLeaves[0] = leafDatas[firstDelIdx]
-	delLeaves[1] = leafDatas[secondDelIdx]
-
-	ud, err := GenerateUData(delLeaves, &p)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	delHashes := make([]utreexo.Hash, delCount)
-	delHashes[0] = leafDatas[firstDelIdx].LeafHash()
-	delHashes[1] = leafDatas[secondDelIdx].LeafHash()
-
-	// Test if the UData actually validates
-	err = p.Verify(delHashes, ud.AccProof, false)
-	if err != nil {
-		t.Errorf("Generated UData not verifiable")
-	}
-
-	// Use the udata.
-	err = p.Modify(nil, delHashes, ud.AccProof)
-	if err != nil {
-		t.Fatal(err)
 	}
 }

@@ -5,19 +5,19 @@
 package wire
 
 import (
-	"encoding/hex"
 	"fmt"
 	"io"
 
 	"github.com/utreexo/utreexo"
+	"github.com/utreexo/utreexod/chaincfg/chainhash"
 )
 
-// UData contains data needed to prove the existence and validity of all inputs
-// for a Bitcoin block.  With this data, a full node may only keep the utreexo
-// roots and still be able to fully validate a block.
+// UData contains data sent over the wire from other utreexo peers to prove the
+// existence and validity of all inputs for a Bitcoin block.  With this data,
+// a full node may only keep the utreexo roots and still be able to fully validate a block.
 type UData struct {
-	// AccProof is the utreexo accumulator proof for all the inputs.
-	AccProof utreexo.Proof
+	// ProofHashes are the hashes needed to hash up to the merkle roots.
+	ProofHashes []utreexo.Hash
 
 	// LeafDatas are the tx validation data for every input.
 	LeafDatas []LeafData
@@ -45,11 +45,19 @@ func (ud *UData) SerializeUtxoDataSize() int {
 	return size
 }
 
+// SerializedHashSizes returns how many bytes it would take to serialize the
+// hashes in the udata.
+func SerializedHashSizes(hashes []utreexo.Hash) int {
+	size := VarIntSerializeSize(uint64(len(hashes)))
+	size += chainhash.HashSize * len(hashes)
+	return size
+}
+
 // SerializeSize returns the number of bytes it would take to serialize the
 // UData.
 func (ud *UData) SerializeSize() int {
 	// Leaf data size.
-	return BatchProofSerializeSize(&ud.AccProof) + ud.SerializeUtxoDataSize()
+	return SerializedHashSizes(ud.ProofHashes) + ud.SerializeUtxoDataSize()
 }
 
 // -----------------------------------------------------------------------------
@@ -74,11 +82,16 @@ func (ud *UData) SerializeSize() int {
 
 // Serialize encodes the UData to w using the UData serialization format.
 func (ud *UData) Serialize(w io.Writer) error {
-	// Write batch proof.
-	err := BatchProofSerialize(w, &ud.AccProof)
+	err := WriteVarInt(w, 0, uint64(len(ud.ProofHashes)))
 	if err != nil {
-		returnErr := messageError("Serialize", err.Error())
-		return returnErr
+		return err
+	}
+
+	for _, h := range ud.ProofHashes {
+		_, err = w.Write(h[:])
+		if err != nil {
+			return err
+		}
 	}
 
 	// Write the size of the leaf datas.
@@ -100,12 +113,18 @@ func (ud *UData) Serialize(w io.Writer) error {
 
 // Deserialize encodes the UData to w using the UData serialization format.
 func (ud *UData) Deserialize(r io.Reader) error {
-	proof, err := BatchProofDeserialize(r)
+	proofCount, err := ReadVarInt(r, 0)
 	if err != nil {
-		returnErr := messageError("Deserialize AccProof", err.Error())
-		return returnErr
+		return err
 	}
-	ud.AccProof = *proof
+
+	proofs := make([]utreexo.Hash, proofCount)
+	for i := range proofs {
+		_, err = io.ReadFull(r, proofs[i][:])
+		if err != nil {
+			return err
+		}
+	}
 
 	udCount, err := ReadVarInt(r, 0)
 	if err != nil {
@@ -116,8 +135,8 @@ func (ud *UData) Deserialize(r io.Reader) error {
 	for i := range ud.LeafDatas {
 		err = ud.LeafDatas[i].Deserialize(r)
 		if err != nil {
-			str := fmt.Sprintf("targetCount:%d, Stxos[%d], err:%s\n",
-				len(ud.AccProof.Targets), i, err.Error())
+			str := fmt.Sprintf("Stxos[%d], err:%s\n",
+				i, err.Error())
 			returnErr := messageError("Deserialize stxos", str)
 			return returnErr
 		}
@@ -148,12 +167,6 @@ func (ud *UData) Deserialize(r io.Reader) error {
 //
 // -----------------------------------------------------------------------------
 
-// SerializeAccSizeCompact returns the number of bytes it would take to serialize
-// the accumulator with the compact accumulator serialization format.
-func (ud *UData) SerializeAccSizeCompact() int {
-	return BatchProofSerializeSize(&ud.AccProof)
-}
-
 // SerializeUxtoDataSizeCompact returns the number of bytes it would take to serialize
 // the utxo data and the remember idx data with the compact serialization format.
 func (ud *UData) SerializeUxtoDataSizeCompact() int {
@@ -171,8 +184,8 @@ func (ud *UData) SerializeUxtoDataSizeCompact() int {
 // SerializeSizeCompact returns the number of bytes it would take to serialize the
 // UData using the compact UData serialization format.
 func (ud *UData) SerializeSizeCompact() int {
-	// Accumulator proof size + leaf data size
-	return BatchProofSerializeSize(&ud.AccProof) + ud.SerializeUxtoDataSizeCompact()
+	// Accumulator hash proof size + leaf data size
+	return SerializedHashSizes(ud.ProofHashes) + ud.SerializeUxtoDataSizeCompact()
 }
 
 // SerializeCompact encodes the UData to w using the compact UData
@@ -180,10 +193,16 @@ func (ud *UData) SerializeSizeCompact() int {
 // the exception that compact leaf data serialization is used.  Everything else
 // remains the same.
 func (ud *UData) SerializeCompact(w io.Writer) error {
-	err := BatchProofSerialize(w, &ud.AccProof)
+	err := WriteVarInt(w, 0, uint64(len(ud.ProofHashes)))
 	if err != nil {
-		returnErr := messageError("SerializeCompact", err.Error())
-		return returnErr
+		return err
+	}
+
+	for _, h := range ud.ProofHashes {
+		_, err = w.Write(h[:])
+		if err != nil {
+			return err
+		}
 	}
 
 	err = WriteVarInt(w, 0, uint64(len(ud.LeafDatas)))
@@ -209,11 +228,18 @@ func (ud *UData) SerializeCompact(w io.Writer) error {
 // in as a correct txCount is critical for deserializing correctly.  When
 // deserializing a block, txInCount does not matter.
 func (ud *UData) DeserializeCompact(r io.Reader) error {
-	proof, err := BatchProofDeserialize(r)
+	proofCount, err := ReadVarInt(r, 0)
 	if err != nil {
 		return err
 	}
-	ud.AccProof = *proof
+
+	proofs := make([]utreexo.Hash, proofCount)
+	for i := range proofs {
+		_, err = io.ReadFull(r, proofs[i][:])
+		if err != nil {
+			return err
+		}
+	}
 
 	// Grab the count for the udatas
 	udCount, err := ReadVarInt(r, 0)
@@ -225,156 +251,12 @@ func (ud *UData) DeserializeCompact(r io.Reader) error {
 	for i := range ud.LeafDatas {
 		err = ud.LeafDatas[i].DeserializeCompact(r)
 		if err != nil {
-			str := fmt.Sprintf("targetCount:%d, LeafDatas[%d], err:%s\n",
-				len(ud.AccProof.Targets), i, err.Error())
+			str := fmt.Sprintf("LeafDatas[%d], err:%s\n",
+				i, err.Error())
 			returnErr := messageError("Deserialize leaf datas", str)
 			return returnErr
 		}
 	}
 
 	return nil
-}
-
-// SerializeSizeCompactNoAccProof returns the number of bytes it would take to
-// serialize the utreexo data without the accumulator proof.
-func (ud *UData) SerializeSizeCompactNoAccProof() int {
-	size := VarIntSerializeSize(uint64(len(ud.AccProof.Targets)))
-	for _, target := range ud.AccProof.Targets {
-		size += VarIntSerializeSize(target)
-	}
-
-	return size + ud.SerializeUxtoDataSizeCompact()
-}
-
-// SerializeCompactNoAccProof will serialize the utreexo data with the compact
-// utreexo data format but will leave out the accumulator proof.
-func (ud *UData) SerializeCompactNoAccProof(w io.Writer) error {
-	// Serialize the targets.
-	bp := ud.AccProof
-	err := WriteVarInt(w, 0, uint64(len(bp.Targets)))
-	if err != nil {
-		return err
-	}
-
-	for _, t := range bp.Targets {
-		err = WriteVarInt(w, 0, t)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Write all the leafDatas.
-	err = WriteVarInt(w, 0, uint64(len(ud.LeafDatas)))
-	if err != nil {
-		return err
-	}
-	for _, ld := range ud.LeafDatas {
-		err := ld.SerializeCompact(w)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// DeserializeCompactNoAccProof will deserialize the utreexo data that has been
-// serialized without the accumulator proof.
-//
-// NOTE: this function should only be called on udata that has been compactly serialized
-// without the accumulator proof.
-func (ud *UData) DeserializeCompactNoAccProof(r io.Reader) error {
-	// Deserialize the targets.
-	targetCount, err := ReadVarInt(r, 0)
-	if err != nil {
-		return err
-	}
-	targets := make([]uint64, targetCount)
-	for i := range targets {
-		target, err := ReadVarInt(r, 0)
-		if err != nil {
-			return err
-		}
-
-		targets[i] = target
-	}
-	ud.AccProof = utreexo.Proof{Targets: targets}
-
-	// Grab the count for the udatas
-	udCount, err := ReadVarInt(r, 0)
-	if err != nil {
-		return err
-	}
-	ud.LeafDatas = make([]LeafData, udCount)
-	for i := range ud.LeafDatas {
-		err := ud.LeafDatas[i].DeserializeCompact(r)
-		if err != nil {
-			str := fmt.Sprintf("targetCount:%d, LeafDatas[%d], err:%s\n",
-				len(ud.AccProof.Targets), i, err.Error())
-			returnErr := messageError("Deserialize leaf datas", str)
-			return returnErr
-		}
-	}
-
-	return nil
-}
-
-// HashesFromLeafDatas hashes the passed in leaf datas. Returns an error if a
-// leaf data is compact as you can't generate the correct hash.
-func HashesFromLeafDatas(leafDatas []LeafData) ([]utreexo.Hash, error) {
-	// make slice of hashes from leafdata
-	delHashes := make([]utreexo.Hash, 0, len(leafDatas))
-	for _, ld := range leafDatas {
-		// We can't calculate the correct hash if the leaf data is in
-		// the compact state.
-		if ld.IsCompact() {
-			return nil, fmt.Errorf("leafdata is compact. Unable " +
-				"to generate a leafhash")
-		}
-
-		delHashes = append(delHashes, ld.LeafHash())
-	}
-
-	return delHashes, nil
-}
-
-// GenerateUData creates a block proof, calling forest.ProveBatch with the leaf indexes
-// to get a batched inclusion proof from the accumulator. It then adds on the leaf data,
-// to create a block proof which both proves inclusion and gives all utxo data
-// needed for transaction verification.
-func GenerateUData(txIns []LeafData, pollard utreexo.Utreexo) (
-	*UData, error) {
-
-	ud := new(UData)
-	ud.LeafDatas = txIns
-
-	// Make a slice of hashes from the leafdatas.
-	delHashes, err := HashesFromLeafDatas(ud.LeafDatas)
-	if err != nil {
-		return nil, err
-	}
-
-	// Generate the utreexo accumulator proof for all the inputs.
-	ud.AccProof, err = pollard.Prove(delHashes)
-	if err != nil {
-		// Find out which exact one is causing the error.
-		for i, delHash := range delHashes {
-			_, err = pollard.Prove([]utreexo.Hash{delHash})
-			if err != nil {
-				ld := ud.LeafDatas[i]
-				return nil,
-					fmt.Errorf("LeafData hash %s couldn't be proven. "+
-						"BlockHash %s, Outpoint %s, height %v, "+
-						"IsCoinbase %v, Amount %v, PkScript %s. "+
-						"err: %s",
-						hex.EncodeToString(delHash[:]),
-						ld.BlockHash.String(), ld.OutPoint.String(),
-						ld.Height, ld.IsCoinBase, ld.Amount,
-						hex.EncodeToString(ld.PkScript), err.Error())
-			}
-		}
-		return nil, err
-	}
-
-	return ud, nil
 }
