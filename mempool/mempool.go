@@ -988,6 +988,11 @@ func (mp *TxPool) validateReplacement(tx *btcutil.Tx,
 		conflictsParents = make(map[chainhash.Hash]struct{})
 	)
 	for hash, conflict := range conflicts {
+		txdesc, found := mp.pool[hash]
+		if !found || txdesc == nil {
+			return nil, fmt.Errorf("cannot find tx in the pool")
+		}
+
 		if txFeeRate <= mp.pool[hash].FeePerKB {
 			str := fmt.Sprintf("replacement transaction %v has an "+
 				"insufficient fee rate: needs more than %v, "+
