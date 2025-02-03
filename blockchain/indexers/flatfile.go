@@ -387,6 +387,26 @@ func (ff *FlatFileState) BestHeight() int32 {
 	return ff.currentHeight
 }
 
+// ResetFlatFileState removes all of the data in the files and resets the
+// state to 0.
+func (ff *FlatFileState) ResetFlatFileState() error {
+	ff.mtx.Lock()
+	defer ff.mtx.Unlock()
+
+	ff.currentHeight = 0
+	ff.currentOffset = 0
+	ff.offsets = ff.offsets[:1]
+
+	err := ff.dataFile.Truncate(0)
+	if err != nil {
+		return err
+	}
+
+	// We truncate to 8 because each offset is 8 bytes and we reserve the
+	// space for the genesis block.
+	return ff.offsetFile.Truncate(8)
+}
+
 // deleteFileFile removes the flat file state directory and all the contents
 // in it.
 func deleteFlatFile(path string) error {

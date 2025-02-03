@@ -846,3 +846,62 @@ func TestRecover(t *testing.T) {
 		}
 	}
 }
+
+func TestReset(t *testing.T) {
+	t.Parallel()
+
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	ff, tmpDir, err := initFF("TestReset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir) // clean up. Always runs
+
+	for i := 0; i < 100; i++ {
+		data, err := createRandByteSlice(rnd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = ff.StoreData(int32(i)+1, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = ff.ResetFlatFileState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check that we've successfully reset the flat file.
+	if ff.currentHeight != 0 {
+		t.Fatalf("expected 0 but got %v", ff.currentHeight)
+	}
+
+	if ff.currentOffset != 0 {
+		t.Fatalf("expected 0 but got %v", ff.currentOffset)
+	}
+
+	if len(ff.offsets) != 1 {
+		t.Fatalf("expected 1 but got %v", len(ff.offsets))
+	}
+
+	dataFileSize, err := ff.dataFile.Seek(0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if dataFileSize != 0 {
+		t.Fatalf("expected 0 but got %v", dataFileSize)
+	}
+
+	offsetFileSize, err := ff.offsetFile.Seek(0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if offsetFileSize != 8 {
+		t.Fatalf("expected 8 but got %v", offsetFileSize)
+	}
+}
