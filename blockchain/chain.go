@@ -1633,10 +1633,9 @@ func (b *BlockChain) BestSnapshot() *BestState {
 }
 
 // BestHeader returns the hash and the height of the best header.
+//
+// This function is safe for concurrent access.
 func (b *BlockChain) BestHeader() (chainhash.Hash, int32) {
-	b.chainLock.RLock()
-	defer b.chainLock.RUnlock()
-
 	best := b.bestHeader.Tip()
 	return best.hash, best.height
 }
