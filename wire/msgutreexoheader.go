@@ -6,6 +6,7 @@ package wire
 import (
 	"io"
 
+	"github.com/utreexo/utreexo"
 	"github.com/utreexo/utreexod/chaincfg/chainhash"
 )
 
@@ -17,9 +18,10 @@ const MaxUtreexoHeaderPayload = (28_000 * 8)
 // utreexo block header message. It's used to provide the positions of the inputs
 // that are being spent in the given block.
 type MsgUtreexoHeader struct {
-	BlockHash chainhash.Hash
-	NumAdds   uint16
-	Targets   []uint64
+	BlockHash   chainhash.Hash
+	NumAdds     uint16
+	Targets     []uint64
+	ProofHashes []utreexo.Hash
 }
 
 // BtcDecode decodes r using the bitcoin protocol encoding into the receiver.
@@ -125,6 +127,23 @@ func readUtreexoHeader(r io.Reader, _ uint32, bh *MsgUtreexoHeader) error {
 		}
 	}
 
+	proofCount, err := ReadVarInt(r, 0)
+	if err != nil {
+		// The proof is optional so it just wasn't included.
+		if err == io.EOF {
+			return nil
+		}
+		return err
+	}
+
+	bh.ProofHashes = make([]utreexo.Hash, proofCount)
+	for i := range bh.ProofHashes {
+		_, err = io.ReadFull(r, bh.ProofHashes[i][:])
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -152,6 +171,23 @@ func writeUtreexoHeader(w io.Writer, _ uint32, bh *MsgUtreexoHeader) error {
 
 	for _, t := range bh.Targets {
 		err = WriteVarInt(w, 0, t)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Proof is optional.
+	if len(bh.ProofHashes) == 0 {
+		return nil
+	}
+
+	err = WriteVarInt(w, 0, uint64(len(bh.ProofHashes)))
+	if err != nil {
+		return err
+	}
+
+	for _, proofHash := range bh.ProofHashes {
+		_, err := w.Write(proofHash[:])
 		if err != nil {
 			return err
 		}
