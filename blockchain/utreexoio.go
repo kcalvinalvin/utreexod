@@ -13,7 +13,6 @@ import (
 	"github.com/utreexo/utreexo"
 	"github.com/utreexo/utreexod/blockchain/internal/utreexobackends"
 	"github.com/utreexo/utreexod/chaincfg/chainhash"
-	"github.com/utreexo/utreexod/wire"
 )
 
 // nodeLength is the length of a seriailzed node. 4 because the remember bit is
@@ -279,7 +278,7 @@ func (m *NodesBackEnd) UsageStats() (int64, int64) {
 // RoughSize is a quick calculation of the cached items. The returned value is simply the
 // length multiplied by the cache length.
 func (m *NodesBackEnd) RoughSize() uint64 {
-	return uint64(m.cache.Length()) * (wire.MaxVarIntPayload + nodeLength)
+	return uint64(m.cache.Length()) * (chainhash.HashSize + nodeLength)
 }
 
 // FlushBatch saves all the cached entries to disk and resets the cache map using the Batch.
