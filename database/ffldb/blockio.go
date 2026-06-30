@@ -28,6 +28,7 @@ import (
 const (
 	blockFileExtension        = ".fdb"
 	spendJournalFileExtension = "-undo" + blockFileExtension
+	proofFileExtension        = "-proof" + blockFileExtension
 
 	// The Bitcoin protocol encodes block height as int32, so max number of
 	// blocks is 2^31.  Max block size per the protocol is 32MiB per block.
@@ -47,6 +48,11 @@ const (
 
 	// The name to be used for spend journals.
 	spendJournalFilenameTemplate = "%09d-undo.fdb"
+
+	// The name to be used for utreexo proof files.  Proofs are written only
+	// for utreexo compact state nodes and use the same file number as the
+	// block they prove.
+	proofFilenameTemplate = "%09d-proof.fdb"
 
 	// maxOpenFiles is the max number of open files to maintain in the
 	// open blocks cache.  Note that this does not include the current
@@ -251,6 +257,13 @@ func spendJournalFilePath(dbPath string, fileNum uint32) string {
 	return filepath.Join(dbPath, fileName)
 }
 
+// proofFilePath returns the file path for the provided utreexo proof file
+// number.
+func proofFilePath(dbPath string, fileNum uint32) string {
+	fileName := fmt.Sprintf(proofFilenameTemplate, fileNum)
+	return filepath.Join(dbPath, fileName)
+}
+
 // openWriteFile returns a file handle for the passed flat file number in
 // read/write mode.  The file will be created if needed.  It is typically used
 // for the current file that will have all new data appended.  Unlike openFile,
@@ -436,6 +449,104 @@ func (s *blockStore) writeData(data []byte, fieldName string) error {
 	}
 
 	return nil
+}
+
+// appendProof appends the serialized proof to the proof file corresponding to
+// the provided block file number.  Unlike writeBlock, it never rolls over based
+// on the configured maximum file size.
+//
+// Target file numbers must be monotonic because the write cursor and rollback
+// metadata only describe one current file.  Existing target files are opened
+// at their actual end so appending can never overwrite an earlier record.
+func (s *blockStore) appendProof(proof []byte,
+	blockFileNum uint32) (blockLocation, error) {
+
+	const maxUint32 = uint64(^uint32(0))
+	recordLen := uint64(len(proof)) + 12
+	if recordLen > maxUint32 {
+		str := fmt.Sprintf("serialized data is too large for a flat-file "+
+			"record: got %d bytes, maximum is %d", recordLen, maxUint32)
+		return blockLocation{}, makeDbErr(database.ErrDriverSpecific, str, nil)
+	}
+
+	wc := s.writeCursor
+	wc.Lock()
+	defer wc.Unlock()
+
+	if blockFileNum < wc.curFileNum {
+		str := fmt.Sprintf("cannot append to flat file %d before current "+
+			"write file %d", blockFileNum, wc.curFileNum)
+		return blockLocation{}, makeDbErr(database.ErrDriverSpecific, str, nil)
+	}
+
+	wc.curFile.Lock()
+	defer wc.curFile.Unlock()
+
+	if blockFileNum != wc.curFileNum {
+		if wc.curFile.file != nil {
+			_ = wc.curFile.file.Close()
+		}
+		wc.curFile.file = nil
+		wc.curFileNum = blockFileNum
+		wc.curOffset = 0
+	}
+
+	if wc.curFile.file == nil {
+		file, err := s.openWriteFileFunc(blockFileNum)
+		if err != nil {
+			return blockLocation{}, err
+		}
+		wc.curFile.file = file
+	}
+
+	fileOffset, err := s.fileSizeFunc(blockFileNum)
+	if err != nil {
+		return blockLocation{}, err
+	}
+	if uint64(fileOffset)+recordLen > maxUint32 {
+		str := fmt.Sprintf("flat file %d offset overflows uint32: "+
+			"offset %d plus record length %d", blockFileNum, fileOffset,
+			recordLen)
+		return blockLocation{}, makeDbErr(database.ErrDriverSpecific, str, nil)
+	}
+
+	wc.curOffset = fileOffset
+
+	// Bitcoin network.
+	origOffset := wc.curOffset
+	hasher := crc32.New(castagnoli)
+	var scratch [4]byte
+	byteOrder.PutUint32(scratch[:], uint32(s.network))
+	if err := s.writeData(scratch[:], "network"); err != nil {
+		return blockLocation{}, err
+	}
+	_, _ = hasher.Write(scratch[:])
+
+	// Proof length.
+	proofLen := uint32(len(proof))
+	byteOrder.PutUint32(scratch[:], proofLen)
+	if err := s.writeData(scratch[:], "proof length"); err != nil {
+		return blockLocation{}, err
+	}
+	_, _ = hasher.Write(scratch[:])
+
+	// Serialized proof.
+	if err := s.writeData(proof, "proof"); err != nil {
+		return blockLocation{}, err
+	}
+	_, _ = hasher.Write(proof)
+
+	// Castagnoli CRC-32 as a checksum of all the previous.
+	if err := s.writeData(hasher.Sum(nil), "checksum"); err != nil {
+		return blockLocation{}, err
+	}
+
+	loc := blockLocation{
+		blockFileNum: wc.curFileNum,
+		fileOffset:   origOffset,
+		blockLen:     uint32(recordLen),
+	}
+	return loc, nil
 }
 
 // writeBlock appends the specified raw block bytes to the store's write cursor
@@ -873,6 +984,51 @@ func scanBlockFiles(dbPath string,
 	return firstFile, lastFile, lastFileLen, err
 }
 
+// scanProofFiles mirrors scanBlockFiles but for utreexo proof files. Proofs
+// are written only for utreexo compact state nodes, so a database may hold
+// block and spend journal files with no proof files at all. The proof store
+// cursor is therefore recovered by scanning the proof files directly instead
+// of inferring it from the spend journal file layout the way scanBlockFiles
+// does.
+func scanProofFiles(dbPath string,
+	filePathFunc func(dbPath string, fileNum uint32) string) (int, int, uint32, error) {
+
+	firstFile, lastFile, lastFileLen, err := int(-1), int(-1), uint32(0), error(nil)
+
+	files, err := filepath.Glob(filepath.Join(dbPath, "*"+proofFileExtension))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	sort.Strings(files)
+
+	// Return early if there's no proof files.
+	if len(files) == 0 {
+		return firstFile, lastFile, lastFileLen, nil
+	}
+
+	// Grab the first and last file's number.
+	firstFile, err = strconv.Atoi(strings.TrimSuffix(filepath.Base(files[0]), proofFileExtension))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("scanProofFiles error: %v", err)
+	}
+	lastFile, err = strconv.Atoi(strings.TrimSuffix(filepath.Base(files[len(files)-1]), proofFileExtension))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("scanProofFiles error: %v", err)
+	}
+
+	// Get the last file's length.
+	filePath := filePathFunc(dbPath, uint32(lastFile))
+	st, err := os.Stat(filePath)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	lastFileLen = uint32(st.Size())
+
+	log.Tracef("Scan found latest proof file #%d with length %d", lastFile, lastFileLen)
+
+	return firstFile, lastFile, lastFileLen, err
+}
+
 // newBlockStore returns a new block store with the current block file number
 // and offset set and all fields initialized.
 func newBlockStore(basePath string, network wire.BitcoinNet) (*blockStore, error) {
@@ -946,5 +1102,51 @@ func newSJStore(basePath string, network wire.BitcoinNet) (*blockStore, error) {
 	store.fileSizeFunc = store.fileSize
 	store.filePathFunc = spendJournalFilePath
 	store.fileStartEndNumFunc = store.fileStartEndNum
+	return store, nil
+}
+
+// newProofStore returns a new utreexo proof store with the current proof file
+// number and offset set and all fields initialized.
+func newProofStore(basePath string, network wire.BitcoinNet) (*blockStore, error) {
+	// Look for the end of the latest proof file to determine what the write
+	// cursor position is from the viewpoint of the proof files on disk.
+	_, fileNum, fileOff, err := scanProofFiles(basePath, proofFilePath)
+	if err != nil {
+		return nil, err
+	}
+	if fileNum == -1 {
+		fileNum = 0
+		fileOff = 0
+	}
+
+	store := &blockStore{
+		network:          network,
+		basePath:         basePath,
+		maxBlockFileSize: maxBlockFileSize,
+		openBlockFiles:   make(map[uint32]*lockableFile),
+		openBlocksLRU:    list.New(),
+		fileNumToLRUElem: make(map[uint32]*list.Element),
+
+		writeCursor: &writeCursor{
+			curFile:    &lockableFile{},
+			curFileNum: uint32(fileNum),
+			curOffset:  fileOff,
+		},
+	}
+	store.openFileFunc = store.openFile
+	store.openWriteFileFunc = store.openWriteFile
+	store.deleteFileFunc = store.deleteFile
+	store.fileSizeFunc = store.fileSize
+	store.filePathFunc = proofFilePath
+	// Proof files exist only on utreexo nodes, so the cursor must be sized
+	// from the proof files rather than the spend journal files scanBlockFiles
+	// inspects.
+	store.fileStartEndNumFunc = func() (uint32, uint32, error) {
+		first, last, _, err := scanProofFiles(store.basePath, store.filePathFunc)
+		if err != nil {
+			return 0, 0, err
+		}
+		return uint32(first), uint32(last), nil
+	}
 	return store, nil
 }

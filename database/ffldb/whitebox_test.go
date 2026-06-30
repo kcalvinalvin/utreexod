@@ -8,6 +8,7 @@
 package ffldb
 
 import (
+	"bytes"
 	"compress/bzip2"
 	"encoding/binary"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	ldberrors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/utreexo/utreexod/btcutil"
 	"github.com/utreexo/utreexod/chaincfg"
+	"github.com/utreexo/utreexod/chaincfg/chainhash"
 	"github.com/utreexo/utreexod/database"
 	"github.com/utreexo/utreexod/wire"
 )
@@ -727,6 +729,263 @@ func testAssertSameFileNum(tc *testContext) bool {
 	}
 
 	return true
+}
+
+// TestUtreexoProofPruning verifies that pruning a utreexo database deletes
+// each pruned block's proof along with the block, and keeps the proofs of the
+// blocks it retains.  Proof files use the same file number as the block file
+// that contains the proven block.
+func TestUtreexoProofPruning(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ffldb-proofprune")
+	idb, err := database.Create(dbType, dbPath, blockDataNet)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer idb.Close()
+
+	// Force many small flat files so that pruning has whole files to delete.
+	pdb := idb.(*db)
+	pdb.blkStore.maxBlockFileSize = 1024
+	pdb.sjStore.maxBlockFileSize = 1024
+	pdb.proofStore.maxBlockFileSize = 1024
+
+	blocks, err := loadBlocks(t, blockDataFile, blockDataNet)
+	if err != nil {
+		t.Fatalf("loadBlocks: %v", err)
+	}
+	blockHeights := make(map[chainhash.Hash]int, len(blocks))
+	for i, block := range blocks {
+		blockHeights[*block.Hash()] = i
+	}
+
+	// proofFor returns a deterministic proof payload for the block at the given
+	// index so the stored proofs can be checked byte for byte.
+	proofFor := func(i int) []byte {
+		p := make([]byte, 64)
+		for j := range p {
+			p[j] = byte(i + j)
+		}
+		return p
+	}
+
+	// Store every block after genesis together with a spend journal and a
+	// proof, all in one transaction so the proof aligns with its block file.
+	err = idb.Update(func(tx database.Tx) error {
+		for i, block := range blocks {
+			if i == 0 {
+				// The genesis block carries no proof.
+				continue
+			}
+			if err := tx.StoreBlock(block); err != nil {
+				return err
+			}
+			raw, err := block.Bytes()
+			if err != nil {
+				return err
+			}
+			if err := tx.StoreSpendJournal(block.Hash(), raw); err != nil {
+				return err
+			}
+			if err := tx.StoreUtreexoProof(block.Hash(), proofFor(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	proofFileHeights := make(map[uint32][]int)
+	err = idb.View(func(tx database.Tx) error {
+		blockIdx := tx.Metadata().Bucket(blockIdxBucketName)
+		if blockIdx == nil {
+			t.Fatal("block index bucket missing")
+		}
+		proofIdx := tx.Metadata().Bucket(proofIdxBucketName)
+		if proofIdx == nil {
+			t.Fatal("proof index bucket missing")
+		}
+
+		return proofIdx.ForEach(func(hashBytes, proofRow []byte) error {
+			var hash chainhash.Hash
+			copy(hash[:], hashBytes)
+			height, ok := blockHeights[hash]
+			if !ok {
+				t.Fatalf("unknown proof hash %v", hash)
+			}
+
+			loc := deserializeBlockLoc(proofRow)
+			blockRow := blockIdx.Get(hash[:])
+			if blockRow == nil {
+				t.Fatalf("block index row missing for proof hash %v", hash)
+			}
+			blockLoc := deserializeBlockLoc(blockRow)
+			if loc.blockFileNum != blockLoc.blockFileNum {
+				t.Fatalf("proof for block %d wrote to file %d, want block file %d",
+					height, loc.blockFileNum, blockLoc.blockFileNum)
+			}
+			proofFileHeights[loc.blockFileNum] = append(
+				proofFileHeights[loc.blockFileNum], height)
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("scan proof index: %v", err)
+	}
+
+	// Prune down to a tiny target while keeping the most recent 30 blocks.
+	keepHeight := int32(len(blocks) - 30)
+	var earliest int32
+	err = idb.Update(func(tx database.Tx) error {
+		earliest, err = tx.PruneBlocks(2048, keepHeight)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("PruneBlocks: %v", err)
+	}
+	if earliest <= 1 {
+		t.Fatalf("expected pruning to advance the earliest kept height, got %d",
+			earliest)
+	}
+
+	err = idb.View(func(tx database.Tx) error {
+		// Proofs of pruned blocks are gone.
+		for i := 1; i < int(earliest)-1; i++ {
+			proof, err := tx.FetchUtreexoProof(blocks[i].Hash())
+			if err != nil {
+				return err
+			}
+			if proof != nil {
+				t.Fatalf("proof for pruned block %d should be gone, got %d bytes",
+					i, len(proof))
+			}
+		}
+
+		// Proofs of retained blocks are intact.
+		for i := len(blocks) - 30; i < len(blocks); i++ {
+			proof, err := tx.FetchUtreexoProof(blocks[i].Hash())
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(proof, proofFor(i)) {
+				t.Fatalf("proof for kept block %d mismatch: got %d bytes",
+					i, len(proof))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	// The proof flat file for the first (fully pruned) block file number must
+	// have been deleted from disk, not just dropped from the index.
+	for fileNum, heights := range proofFileHeights {
+		hasPrunedProof := false
+		hasKeptProof := false
+		for _, height := range heights {
+			if height < int(earliest) {
+				hasPrunedProof = true
+			} else {
+				hasKeptProof = true
+			}
+		}
+
+		_, err := os.Stat(proofFilePath(dbPath, fileNum))
+		if hasPrunedProof && !hasKeptProof && !os.IsNotExist(err) {
+			t.Fatalf("proof file %d should have been pruned, stat err: %v",
+				fileNum, err)
+		}
+		if hasKeptProof && err != nil {
+			t.Fatalf("proof file %d should have been kept, stat err: %v",
+				fileNum, err)
+		}
+	}
+}
+
+// TestUtreexoProofReconcileRollback simulates an unclean shutdown that occurs
+// after a proof's bytes are written and synced to the proof flat file but
+// before the metadata batch (the proof index entry and the proof write cursor)
+// is committed.  Reopening the database must detect that the proof files on
+// disk are ahead of the metadata and roll the proof store back to the
+// committed position instead of returning a corruption error.
+func TestUtreexoProofReconcileRollback(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ffldb-proofreconcile")
+	idb, err := database.Create(dbType, dbPath, blockDataNet)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Write orphan proof bytes straight to the proof store, advancing and
+	// syncing its write cursor without committing any metadata.  This is the
+	// on-disk state left by a crash mid-commit.
+	pdb := idb.(*db)
+	if _, err := pdb.proofStore.writeBlock(make([]byte, 4096), nil); err != nil {
+		t.Fatalf("writeBlock: %v", err)
+	}
+	if err := pdb.proofStore.syncBlocks(); err != nil {
+		t.Fatalf("syncBlocks: %v", err)
+	}
+	if pdb.proofStore.writeCursor.curOffset == 0 {
+		t.Fatal("expected the proof write cursor to have advanced")
+	}
+	if err := idb.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen.  reconcileDB must roll the proof store back to (0, 0) rather
+	// than erroring, because the metadata proof write cursor was never moved.
+	idb, err = database.Open(dbType, dbPath, blockDataNet)
+	if err != nil {
+		t.Fatalf("Open should reconcile the orphan proof bytes, got: %v", err)
+	}
+	defer idb.Close()
+
+	pdb = idb.(*db)
+	wc := pdb.proofStore.writeCursor
+	if wc.curFileNum != 0 || wc.curOffset != 0 {
+		t.Fatalf("proof write cursor not rolled back: file %d, offset %d",
+			wc.curFileNum, wc.curOffset)
+	}
+
+	// The database must remain usable: a block and its proof stored after
+	// recovery round trip correctly.
+	blocks, err := loadBlocks(t, blockDataFile, blockDataNet)
+	if err != nil {
+		t.Fatalf("loadBlocks: %v", err)
+	}
+	block := blocks[1]
+	want := []byte("recovered-proof-payload")
+	err = idb.Update(func(tx database.Tx) error {
+		if err := tx.StoreBlock(block); err != nil {
+			return err
+		}
+		rawBlock, err := block.Bytes()
+		if err != nil {
+			return err
+		}
+		if err := tx.StoreSpendJournal(block.Hash(), rawBlock); err != nil {
+			return err
+		}
+		return tx.StoreUtreexoProof(block.Hash(), want)
+	})
+	if err != nil {
+		t.Fatalf("StoreUtreexoProof after recovery: %v", err)
+	}
+	err = idb.View(func(tx database.Tx) error {
+		got, err := tx.FetchUtreexoProof(block.Hash())
+		if err != nil {
+			return err
+		}
+		if string(got) != string(want) {
+			t.Fatalf("proof mismatch after recovery: got %q", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("FetchUtreexoProof after recovery: %v", err)
+	}
 }
 
 // TestFailureScenarios ensures several failure scenarios such as database
