@@ -1,76 +1,45 @@
 # Installation
 
-The first step is to install btcd.  See one of the following sections for
-details on how to install on the supported operating systems.
+This guide covers how to build and install `utreexod` from source.
 
 ## Requirements
 
-[Go](http://golang.org) 1.11 or newer.
+- [Go](http://golang.org) 1.25 or newer.
+- [Rust](http://rust-lang.org) 1.81.0 or newer (Required if you want to compile the built-in [BDK wallet](https://bitcoindevkit.org) support).
 
-## GPG Verification Key
+## Building from Source (All Operating Systems)
 
-All official release tags are signed by Conformal so users can ensure the code
-has not been tampered with and is coming from the btcsuite developers.  To
-verify the signature perform the following:
-
-* Download the Conformal public key:
-  https://raw.githubusercontent.com/btcsuite/btcd/master/release/GIT-GPG-KEY-conformal.txt
-
-* Import the public key into your GPG keyring:
-
-  ```bash
-  gpg --import GIT-GPG-KEY-conformal.txt
-  ```
-
-* Verify the release tag with the following command where `TAG_NAME` is a
-  placeholder for the specific tag:
-
-  ```bash
-  git tag -v TAG_NAME
-  ```
-
-## Windows Installation
-
-* Install the MSI available at: [btcd windows installer](https://github.com/btcsuite/btcd/releases)
-* Launch btcd from the Start Menu
-
-## Linux/BSD/MacOSX/POSIX Installation
-
-* Install Go according to the [installation instructions](http://golang.org/doc/install)
-* Ensure Go was installed properly and is a supported version:
+1. Install Go according to the [official installation instructions](http://golang.org/doc/install).
+2. Install Rust using [rustup](https://rustup.rs/) (if you plan to use the BDK wallet).
+3. Clone the repository and navigate into it:
 
 ```bash
-go version
-go env GOROOT GOPATH
+git clone https://github.com/utreexo/utreexod
+cd utreexod
 ```
 
-NOTE: The `GOROOT` and `GOPATH` above must not be the same path.  It is
-recommended that `GOPATH` is set to a directory in your home directory such as
-`~/goprojects` to avoid write permission issues.  It is also recommended to add
-`$GOPATH/bin` to your `PATH` at this point.
+4. Build the project. You have two options depending on whether you want wallet support:
 
-* Run the following commands to obtain btcd, all dependencies, and install it:
+**To build WITH the BDK wallet (requires Rust):**
+```bash
+make all
+```
+To install the binaries directly to your `$GOPATH/bin`:
+```bash
+make install
+```
+
+**To build WITHOUT the BDK wallet (Go only):**
 
 ```bash
-git clone https://github.com/btcsuite/btcd $GOPATH/src/github.com/btcsuite/btcd
-cd $GOPATH/src/github.com/btcsuite/btcd
-GO111MODULE=on go install -v . ./cmd/...
+go build -o . ./...
 ```
-
-* btcd (and utilities) will now be installed in ```$GOPATH/bin```.  If you did
-  not already add the bin directory to your system path during Go installation,
-  we recommend you do so now.
-
-## Gentoo Linux Installation
-
-* [Install Layman](https://gitlab.com/bitcoin/gentoo) and enable the Bitcoin overlay.
-* Copy or symlink `/var/lib/layman/bitcoin/Documentation/package.keywords/btcd-live` to `/etc/portage/package.keywords/`
-* Install btcd: `$ emerge net-p2p/btcd`
 
 ## Startup
 
-Typically btcd will run and start downloading the block chain with no extra
-configuration necessary, however, there is an optional method to use a
-`bootstrap.dat` file that may speed up the initial block chain download process.
+Because `utreexod` uses a hardcoded UTXO state, the node will bootstrap almost instantly and skip the traditional initial block download. 
 
-* [Using bootstrap.dat](https://github.com/btcsuite/btcd/blob/master/docs/configuration.md#using-bootstrapdat)
+Simply run:
+```bash
+./utreexod
+```

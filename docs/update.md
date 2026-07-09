@@ -1,8 +1,20 @@
-# Update
+# Updating utreexod
 
-* Run the following commands to update btcd, all dependencies, and install it:
+To update `utreexod` and its utilities to the latest version, navigate to the directory where you cloned the repository and pull the latest changes:
 
 ```bash
-cd $GOPATH/src/github.com/btcsuite/btcd
-git pull && GO111MODULE=on go install -v . ./cmd/...
+cd utreexod
+git pull
+```
+
+Then, rebuild the binaries using the same method you used for installation:
+
+**If you are using the BDK wallet:**
+```bash
+make all
+```
+
+**If you are building without the wallet:**
+```bash
+go build -o . ./...
 ```
