@@ -2802,6 +2802,12 @@ func New(config *Config) (*BlockChain, error) {
 		return nil, err
 	}
 
+	// Backfill the utreexo proof store from the proofs serialized inline
+	// with the block bytes by older versions.
+	if err := b.maybeUpgradeUtreexoProofStore(config.Interrupt); err != nil {
+		return nil, err
+	}
+
 	bestNode := b.bestChain.Tip()
 
 	// Only check for the consistent state of the utxo cache if it exists.

@@ -28,6 +28,11 @@ const (
 	// latestUtxoSetBucketVersion is the current version of the utxo set
 	// bucket that is used to track all unspent outputs.
 	latestUtxoSetBucketVersion = 2
+
+	// utreexoProofStoreVersion is the current version of the utreexo proof
+	// store.  Version 1 stores new and active-chain proofs separately from
+	// the block bytes.
+	utreexoProofStoreVersion = 1
 )
 
 var (
@@ -54,6 +59,12 @@ var (
 	// utxoSetVersionKeyName is the name of the db key used to store the
 	// version of the utxo set currently in the database.
 	utxoSetVersionKeyName = []byte("utxosetversion")
+
+	// utreexoProofStoreVersionKeyName is the name of the db key used to store
+	// the version of the utreexo proof store.  An absent key means
+	// proofs are still serialized inline with the block bytes.  Version 1 means
+	// new and active-chain proofs are stored separately.
+	utreexoProofStoreVersionKeyName = []byte("utreexoproofstoreversion")
 
 	// utxoSetBucketName is the name of the db bucket used to house the
 	// unspent transaction output set.
@@ -1304,6 +1315,13 @@ func (b *BlockChain) createChainState() error {
 			}
 
 			err = dbPutUtreexoView(dbTx, b.utreexoView, &node.hash)
+			if err != nil {
+				return err
+			}
+
+			// Record the current proof store version for the fresh
+			// database.
+			err = dbPutVersion(dbTx, utreexoProofStoreVersionKeyName, utreexoProofStoreVersion)
 			if err != nil {
 				return err
 			}
