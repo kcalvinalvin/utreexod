@@ -1231,3 +1231,39 @@ func TestFailureScenarios(t *testing.T) {
 	// Test various corruption scenarios.
 	testCorruption(tc)
 }
+
+// TestWriteBlockRecordAtUpdatesCursor ensures rewriting the current write
+// file with a truncate updates the write cursor even when the file handle is
+// not open, which is the state right after a database open before any block
+// has been written.
+func TestWriteBlockRecordAtUpdatesCursor(t *testing.T) {
+	dbPath := t.TempDir()
+	store, err := newBlockStore(dbPath, wire.MainNet)
+	if err != nil {
+		t.Fatalf("newBlockStore: %v", err)
+	}
+
+	record := store.serializeBlockRecord([]byte("block"))
+	newSize := uint32(len(record))
+
+	// The write cursor file handle is not open yet, so the record is
+	// written through a handle opened just for the write.
+	if err := store.writeBlockRecordAt(0, 0, record, &newSize); err != nil {
+		t.Fatalf("writeBlockRecordAt: %v", err)
+	}
+
+	store.writeCursor.RLock()
+	offset := store.writeCursor.curOffset
+	store.writeCursor.RUnlock()
+	if offset != newSize {
+		t.Fatalf("write cursor offset = %d, want %d", offset, newSize)
+	}
+
+	fileSize, err := store.fileSize(0)
+	if err != nil {
+		t.Fatalf("fileSize: %v", err)
+	}
+	if fileSize != newSize {
+		t.Fatalf("file size = %d, want %d", fileSize, newSize)
+	}
+}
