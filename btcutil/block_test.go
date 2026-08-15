@@ -300,78 +300,23 @@ func TestBlockErrors(t *testing.T) {
 	}
 }
 
-// TestNewBlockFromBytesWithUtreexoData ensures that NewBlockFromBytes does not
-// automatically attach utreexo data, and that ParseUtreexoData can be used by
-// utreexo nodes to explicitly attach it.
-func TestNewBlockFromBytesWithUtreexoData(t *testing.T) {
+// TestSetUtreexoDataNotSerialized ensures the utreexo proof is no longer part
+// of the block's serialization.  It lives in the proof store.
+func TestSetUtreexoDataNotSerialized(t *testing.T) {
+	var want bytes.Buffer
+	if err := Block100000.Serialize(&want); err != nil {
+		t.Fatalf("Serialize: unexpected error: %v", err)
+	}
+
 	block := btcutil.NewBlock(&Block100000)
-	want := testWireUData()
-	block.SetUtreexoData(want)
-
-	serialized, err := block.Bytes()
-	if err != nil {
-		t.Fatalf("Bytes: unexpected error: %v", err)
-	}
-
-	newBlock, err := btcutil.NewBlockFromBytes(serialized)
-	if err != nil {
-		t.Fatalf("NewBlockFromBytes: unexpected error: %v", err)
-	}
-
-	// Constructors must not auto-attach utreexo data.
-	if newBlock.UtreexoData() != nil {
-		t.Fatalf("expected nil UtreexoData before ParseUtreexoData")
-	}
-
-	// Explicit call attaches the data (utreexo CSN path).
-	newBlock.ParseUtreexoData()
-	assertUDataEqual(t, newBlock.UtreexoData(), want)
-}
-
-// TestNewBlockFromReaderWithUtreexoData ensures that NewBlockFromReader does
-// not automatically attach utreexo data.
-func TestNewBlockFromReaderWithUtreexoData(t *testing.T) {
-	block := btcutil.NewBlock(&Block100000)
-	want := testWireUData()
-	block.SetUtreexoData(want)
-
-	serialized, err := block.Bytes()
-	if err != nil {
-		t.Fatalf("Bytes: unexpected error: %v", err)
-	}
-
-	newBlock, err := btcutil.NewBlockFromReader(bytes.NewReader(serialized))
-	if err != nil {
-		t.Fatalf("NewBlockFromReader: unexpected error: %v", err)
-	}
-
-	// Constructors must not auto-attach utreexo data.
-	if newBlock.UtreexoData() != nil {
-		t.Fatalf("expected nil UtreexoData from NewBlockFromReader")
-	}
-
-	// Explicit call attaches the data (utreexo CSN path).
-	newBlock.ParseUtreexoData()
-	assertUDataEqual(t, newBlock.UtreexoData(), want)
-}
-
-// TestSetUtreexoDataInvalidatesCache ensures cached serialization is rebuilt
-// once the Utreexo data changes.
-func TestSetUtreexoDataInvalidatesCache(t *testing.T) {
-	block := btcutil.NewBlock(&Block100000)
-	base, err := block.Bytes()
-	if err != nil {
-		t.Fatalf("Bytes: unexpected error: %v", err)
-	}
-
 	block.SetUtreexoData(testWireUData())
-	withProof, err := block.Bytes()
+	got, err := block.Bytes()
 	if err != nil {
-		t.Fatalf("Bytes (with utreexo data): unexpected error: %v", err)
+		t.Fatalf("Bytes: unexpected error: %v", err)
 	}
 
-	if bytes.Equal(base, withProof) {
-		t.Fatalf("expected serialized block to change once utreexo data added")
+	if !bytes.Equal(got, want.Bytes()) {
+		t.Fatalf("serialized block must not change when utreexo data is set")
 	}
 }
 

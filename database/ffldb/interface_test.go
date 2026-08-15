@@ -115,6 +115,168 @@ func loadBlocks(t *testing.T, dataFile string, network wire.BitcoinNet) ([]*btcu
 	return blocks, nil
 }
 
+// makeProof returns a deterministic proof-shaped payload of the given size for
+// the given seed.
+func makeProof(seed byte, size int) []byte {
+	p := make([]byte, size)
+	for i := range p {
+		p[i] = seed + byte(i)
+	}
+	return p
+}
+
+// TestUtreexoProofStore exercises the utreexo proof store through
+// the public database interface: storing proofs of varying sizes, fetching
+// them back, a miss returning nil, persistence across a close/reopen (which
+// recovers the proof write cursor from the proof files on disk), and appending
+// more proofs after a reopen.
+func TestUtreexoProofStore(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "db")
+	db, err := database.Create("ffldb", dbPath, wire.MainNet)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+
+	blocks, err := loadBlocks(t, blockDataFile, blockDataNet)
+	if err != nil {
+		t.Fatalf("loadBlocks: %v", err)
+	}
+
+	store := func(testName string, d database.DB, testBlocks []*btcutil.Block,
+		set map[chainhash.Hash][]byte) {
+		t.Helper()
+
+		err := d.Update(func(tx database.Tx) error {
+			for _, block := range testBlocks {
+				if err := tx.StoreBlock(block); err != nil {
+					return err
+				}
+				rawBlock, err := block.Bytes()
+				if err != nil {
+					return err
+				}
+				hash := block.Hash()
+				if err := tx.StoreSpendJournal(hash, rawBlock); err != nil {
+					return err
+				}
+				if err := tx.StoreUtreexoProof(hash, set[*hash]); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("%s: StoreUtreexoProof: %v", testName, err)
+		}
+	}
+	verify := func(testName string, d database.DB,
+		set map[chainhash.Hash][]byte) {
+
+		t.Helper()
+		err := d.View(func(tx database.Tx) error {
+			for h, want := range set {
+				h := h
+				got, err := tx.FetchUtreexoProof(&h)
+				if err != nil {
+					return err
+				}
+				if !bytes.Equal(got, want) {
+					t.Fatalf("%s: proof mismatch for %v: got %d bytes, "+
+						"want %d", testName, h, len(got), len(want))
+				}
+			}
+			// A hash with no stored proof must return (nil, nil).
+			got, err := tx.FetchUtreexoProof(blocks[0].Hash())
+			if err != nil {
+				return err
+			}
+			if got != nil {
+				t.Fatalf("%s: expected nil for missing proof, got %d bytes",
+					testName, len(got))
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("%s: FetchUtreexoProof: %v", testName, err)
+		}
+	}
+
+	tests := []struct {
+		name              string
+		blocks            []*btcutil.Block
+		seedBase          byte
+		proofSizeBase     int
+		proofSizeStep     int
+		reopenBefore      bool
+		checkMissingBlock bool
+	}{
+		{
+			name:              "initial batch",
+			blocks:            blocks[1:41],
+			proofSizeBase:     200,
+			proofSizeStep:     64,
+			checkMissingBlock: true,
+		},
+		{
+			name:          "append after reopen",
+			blocks:        blocks[100:120],
+			seedBase:      100,
+			proofSizeBase: 600,
+			proofSizeStep: 1,
+			reopenBefore:  true,
+		},
+	}
+
+	var storedProofs []map[chainhash.Hash][]byte
+	for _, test := range tests {
+		if test.reopenBefore {
+			// The proof write cursor must be recovered from the proof files
+			// on disk, and all proofs must still be readable before more are
+			// appended.
+			if err := db.Close(); err != nil {
+				t.Fatalf("%s: Close: %v", test.name, err)
+			}
+			db, err = database.Open("ffldb", dbPath, wire.MainNet)
+			if err != nil {
+				t.Fatalf("%s: Open: %v", test.name, err)
+			}
+			for _, proofs := range storedProofs {
+				verify(test.name+" before append", db, proofs)
+			}
+		}
+
+		proofs := make(map[chainhash.Hash][]byte, len(test.blocks))
+		for i, block := range test.blocks {
+			h := *block.Hash()
+			proofs[h] = makeProof(test.seedBase+byte(i),
+				test.proofSizeBase+i*test.proofSizeStep)
+		}
+
+		store(test.name, db, test.blocks, proofs)
+		storedProofs = append(storedProofs, proofs)
+		for _, proofs := range storedProofs {
+			verify(test.name, db, proofs)
+		}
+
+		if test.checkMissingBlock {
+			err = db.Update(func(tx database.Tx) error {
+				return tx.StoreUtreexoProof(blocks[0].Hash(),
+					[]byte("orphan proof"))
+			})
+			if !checkDbError(t, "StoreUtreexoProof missing block", err,
+				database.ErrBlockNotFound) {
+
+				return
+			}
+		}
+	}
+}
+
 // checkDbError ensures the passed error is a database.Error with an error code
 // that matches the passed  error code.
 func checkDbError(t *testing.T, testName string, gotErr error, wantErrCode database.ErrorCode) bool {

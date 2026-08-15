@@ -6,6 +6,7 @@
 package blockchain
 
 import (
+	"bytes"
 	"container/list"
 	"fmt"
 	"sync"
@@ -1424,6 +1425,121 @@ func (b *BlockChain) verifyReorganizationValidity(detachNodes, attachNodes *list
 	return detachBlocks, attachBlocks, detachSpentTxOuts, nil
 }
 
+// storeUtreexoProof persists the proof attached to block.
+func (b *BlockChain) storeUtreexoProof(block *btcutil.Block) error {
+	ud := block.UtreexoData()
+	if ud == nil {
+		return AssertError(fmt.Sprintf("no utreexo proof for block %s",
+			block.Hash()))
+	}
+
+	var buf bytes.Buffer
+	if err := ud.Serialize(&buf); err != nil {
+		return err
+	}
+	return b.db.Update(func(dbTx database.Tx) error {
+		return dbTx.StoreUtreexoProof(block.Hash(), buf.Bytes())
+	})
+}
+
+// reconstructUtreexoViewForParent returns the accumulator state immediately
+// before node by loading the stored state of its nearest best-chain ancestor
+// and replaying the intervening branch blocks.  Every replayed block has a
+// durable proof: current proofs are in the proof store, while proofs written by
+// older versions might still be inline with the block.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) reconstructUtreexoViewForParent(node *blockNode,
+	branch *chainView) (*UtreexoViewpoint, error) {
+
+	// Walk from the block's parent to the fork point, collecting the branch
+	// ancestors whose proofs need to be replayed.
+	var branchNodes []*blockNode
+	forkNode := node.parent
+	for forkNode != nil && !b.bestChain.Contains(forkNode) {
+		branchNodes = append(branchNodes, forkNode)
+		forkNode = forkNode.parent
+	}
+	if forkNode == nil {
+		return nil, AssertError(fmt.Sprintf("block %s does not connect to "+
+			"the main chain", &node.hash))
+	}
+
+	// Load the accumulator state as of the fork point along with the branch
+	// blocks and their stored proofs.  A freshly loaded state holds
+	// only roots and a leaf count and stands alone, so proofs can be
+	// verified and ingested even though the blocks are not on the main
+	// chain.
+	var forkView *UtreexoViewpoint
+	branchBlocks := make([]*btcutil.Block, 0, len(branchNodes))
+	err := b.db.View(func(dbTx database.Tx) error {
+		var err error
+		forkView, err = dbFetchUtreexoView(dbTx, &forkNode.hash)
+		if err != nil {
+			return err
+		}
+
+		// branchNodes is ordered newest first, so load the blocks into
+		// oldest first order for the replay.
+		for i := len(branchNodes) - 1; i >= 0; i-- {
+			n := branchNodes[i]
+			blk, err := dbFetchBlockByNode(dbTx, n, true)
+			if err != nil {
+				return err
+			}
+			branchBlocks = append(branchBlocks, blk)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if forkView == nil {
+		return nil, AssertError(fmt.Sprintf("no stored utreexo state for "+
+			"fork point %s of block %s", &forkNode.hash, &node.hash))
+	}
+
+	// Advance a copy of the fork point state past each branch ancestor
+	// by verifying and ingesting its stored proof.
+	workView := forkView.CopyWithRoots()
+	for _, branchBlock := range branchBlocks {
+		if branchBlock.UtreexoData() == nil {
+			return nil, AssertError(fmt.Sprintf("no stored utreexo proof "+
+				"for branch block %s", branchBlock.Hash()))
+		}
+		err = workView.VerifyUData(branchBlock, branch, branchBlock.UtreexoData())
+		if err != nil {
+			return nil, err
+		}
+		err = workView.ProcessUData(branchBlock, branch, branchBlock.UtreexoData())
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return workView, nil
+}
+
+// validateUtreexoProof verifies and applies the proof attached to block against
+// the accumulator state at node's parent.  It does not persist the proof.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) validateUtreexoProof(node *blockNode,
+	block *btcutil.Block) error {
+
+	branch := newChainView(node)
+	proofView, err := b.reconstructUtreexoViewForParent(node, branch)
+	if err != nil {
+		return err
+	}
+	err = proofView.VerifyUData(block, branch, block.UtreexoData())
+	if err != nil {
+		return err
+	}
+	return proofView.ProcessUData(block, branch, block.UtreexoData())
+}
+
 // connectBestChain handles connecting the passed block to the chain while
 // respecting proper chain selection according to the chain with the most
 // proof of work.  In the typical case, the new block simply extends the main
@@ -1507,12 +1623,23 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 					}
 				}
 			}
+
+			// Persist the proof before updating the accumulator so a
+			// persistence failure leaves the in-memory state unchanged.  The
+			// proof has already passed the applicable validation above.
+			if block.UtreexoData() != nil {
+				if err := b.storeUtreexoProof(block); err != nil {
+					return false, err
+				}
+			}
+
 			// Update the accumulator.
 			err := b.utreexoView.ProcessUData(block, b.bestChain, block.UtreexoData())
 			if err != nil {
 				return false, fmt.Errorf("connectBestChain fail on block %s. "+
 					"Error: %v", block.Hash().String(), err)
 			}
+
 			view := NewUtxoViewpoint()
 			view.SetBestHash(parentHash)
 			err = view.BlockToUtxoView(block)
@@ -1562,6 +1689,19 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	if fastAdd {
 		log.Warnf("fastAdd set in the side chain case? %v\n",
 			block.Hash())
+	}
+
+	// Validate and store the proof before the work comparison so a
+	// reorganization can load it for every block it attaches.
+	if b.utreexoView != nil && block.UtreexoData() != nil {
+		err := b.validateUtreexoProof(node, block)
+		if err != nil {
+			return false, err
+		}
+		err = b.storeUtreexoProof(block)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	// We're extending (or creating) a side chain, but the cumulative
@@ -2659,6 +2799,12 @@ func New(config *Config) (*BlockChain, error) {
 
 	// Perform any upgrades to the various chain-specific buckets as needed.
 	if err := b.maybeUpgradeDbBuckets(config.Interrupt); err != nil {
+		return nil, err
+	}
+
+	// Backfill the utreexo proof store from the proofs serialized inline
+	// with the block bytes by older versions.
+	if err := b.maybeUpgradeUtreexoProofStore(config.Interrupt); err != nil {
 		return nil, err
 	}
 

@@ -68,14 +68,14 @@ func (b *Block) Bytes() ([]byte, error) {
 		return b.serializedBlock, nil
 	}
 
-	// Serialize the MsgBlock.
-	size := b.msgBlock.SerializeSize() + b.utreexoDataSerializeSize()
+	// Serialize the MsgBlock.  The utreexo proof is no longer appended here:
+	// it is stored separately in the database's proof store, written only
+	// after it validates.  ParseUtreexoData still reads the trailing proof of
+	// blocks stored by older versions.
+	size := b.msgBlock.SerializeSize()
 	w := bytes.NewBuffer(make([]byte, 0, size))
 	err := b.msgBlock.Serialize(w)
 	if err != nil {
-		return nil, err
-	}
-	if err := b.appendSerializedUtreexoData(w); err != nil {
 		return nil, err
 	}
 	serializedBlock := w.Bytes()
@@ -235,7 +235,6 @@ func (b *Block) SetHeight(height int32) {
 // SetUtreexoData stores the serialized Utreexo proof data for this block.
 func (b *Block) SetUtreexoData(data *wire.UData) {
 	b.setUtreexoDataInternal(data)
-	b.invalidateSerializedBlock()
 }
 
 // UtreexoData returns the serialized Utreexo proof data for the block.
@@ -296,7 +295,6 @@ func (b *Block) UtreexoTTLs() *wire.UtreexoTTL {
 // SetUtreexoLeafDatas sets the leaf data for the inputs in this block.
 func (b *Block) SetUtreexoLeafDatas(leafDatas []wire.LeafData) {
 	b.ensureUtreexoData().leafDatas = leafDatas
-	b.invalidateSerializedBlock()
 }
 
 // UtreexoLeafDatas returns the leaf data for the inputs in this block.
@@ -310,7 +308,6 @@ func (b *Block) UtreexoLeafDatas() []wire.LeafData {
 // SetUtreexoProof sets the utreexo proof for this block.
 func (b *Block) SetUtreexoProof(proof *utreexo.Proof) {
 	b.ensureUtreexoData().proofData = proof
-	b.invalidateSerializedBlock()
 }
 
 // UtreexoProof returns the utreexo proof for this block.
@@ -401,32 +398,6 @@ func (b *Block) ensureUtreexoData() *blockUtreexoData {
 		b.utreexoData = &blockUtreexoData{}
 	}
 	return b.utreexoData
-}
-
-// invalidateSerializedBlock clears the cached serialized block so it will be
-// regenerated on the next call to Bytes().
-func (b *Block) invalidateSerializedBlock() {
-	b.serializedBlock = nil
-}
-
-// utreexoDataSerializeSize returns the number of bytes needed to serialize the
-// cached Utreexo data.
-func (b *Block) utreexoDataSerializeSize() int {
-	ud := b.UtreexoData()
-	if ud == nil {
-		return 0
-	}
-	return ud.SerializeSize()
-}
-
-// appendSerializedUtreexoData writes the serialized Utreexo data to the writer
-// if any is cached on the block.
-func (b *Block) appendSerializedUtreexoData(w io.Writer) error {
-	ud := b.UtreexoData()
-	if ud == nil {
-		return nil
-	}
-	return ud.Serialize(w)
 }
 
 // attachUtreexoDataFromSerialized attempts to read serialized Utreexo data
