@@ -452,12 +452,8 @@ func (s *blockStore) writeData(data []byte, fieldName string) error {
 }
 
 // appendProof appends the serialized proof to the proof file corresponding to
-// the provided block file number.  Unlike writeBlock, it never rolls over based
-// on the configured maximum file size.
-//
-// Target file numbers must be monotonic because the write cursor and rollback
-// metadata only describe one current file.  Existing target files are opened
-// at their actual end so appending can never overwrite an earlier record.
+// the provided block file number.  Proofs for older block files are appended
+// without moving the current write cursor.
 func (s *blockStore) appendProof(proof []byte,
 	blockFileNum uint32) (blockLocation, error) {
 
@@ -475,9 +471,34 @@ func (s *blockStore) appendProof(proof []byte,
 	defer wc.Unlock()
 
 	if blockFileNum < wc.curFileNum {
-		str := fmt.Sprintf("cannot append to flat file %d before current "+
-			"write file %d", blockFileNum, wc.curFileNum)
-		return blockLocation{}, makeDbErr(database.ErrDriverSpecific, str, nil)
+		fileOffset, err := s.fileSizeFunc(blockFileNum)
+		if err != nil && !os.IsNotExist(err) {
+			return blockLocation{}, err
+		}
+
+		file, err := s.openWriteFileFunc(blockFileNum)
+		if err != nil {
+			return blockLocation{}, err
+		}
+		defer file.Close()
+
+		if err := writeRecordAt(file, blockFileNum, fileOffset, record,
+			nil); err != nil {
+
+			return blockLocation{}, err
+		}
+		if err := file.Sync(); err != nil {
+			str := fmt.Sprintf("failed to sync file %d: %v",
+				blockFileNum, err)
+			return blockLocation{}, makeDbErr(database.ErrDriverSpecific,
+				str, err)
+		}
+
+		return blockLocation{
+			blockFileNum: blockFileNum,
+			fileOffset:   fileOffset,
+			blockLen:     uint32(recordLen),
+		}, nil
 	}
 
 	wc.curFile.Lock()

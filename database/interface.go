@@ -414,10 +414,9 @@ type Tx interface {
 	FetchSpendJournal(hash *chainhash.Hash) ([]byte, error)
 
 	// StoreUtreexoProof stores the provided serialized utreexo proof for the
-	// block identified by blockHash.  It is written atomically with the
-	// transaction and rolled back if the transaction does not commit.  A
-	// validated proof for a block never changes, so the store is effectively
-	// write-once per hash.
+	// block identified by blockHash.  The proof becomes visible atomically with
+	// the transaction.  A validated proof for a block never changes, so the
+	// store is effectively write-once per hash.
 	//
 	// The interface contract guarantees at least the following errors will
 	// be returned (other implementation-specific errors are possible):
