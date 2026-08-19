@@ -468,6 +468,7 @@ func (s *blockStore) appendProof(proof []byte,
 			"record: got %d bytes, maximum is %d", recordLen, maxUint32)
 		return blockLocation{}, makeDbErr(database.ErrDriverSpecific, str, nil)
 	}
+	record := s.serializeBlockRecord(proof)
 
 	wc := s.writeCursor
 	wc.Lock()
@@ -511,34 +512,19 @@ func (s *blockStore) appendProof(proof []byte,
 	}
 
 	wc.curOffset = fileOffset
-
-	// Bitcoin network.
 	origOffset := wc.curOffset
-	hasher := crc32.New(castagnoli)
-	var scratch [4]byte
-	byteOrder.PutUint32(scratch[:], uint32(s.network))
-	if err := s.writeData(scratch[:], "network"); err != nil {
-		return blockLocation{}, err
+	n, err := wc.curFile.file.WriteAt(record, int64(origOffset))
+	wc.curOffset += uint32(n)
+	if err != nil {
+		str := fmt.Sprintf("failed to write proof record to file %d at "+
+			"offset %d: %v", blockFileNum, origOffset, err)
+		return blockLocation{}, makeDbErr(database.ErrDriverSpecific, str, err)
 	}
-	_, _ = hasher.Write(scratch[:])
-
-	// Proof length.
-	proofLen := uint32(len(proof))
-	byteOrder.PutUint32(scratch[:], proofLen)
-	if err := s.writeData(scratch[:], "proof length"); err != nil {
-		return blockLocation{}, err
-	}
-	_, _ = hasher.Write(scratch[:])
-
-	// Serialized proof.
-	if err := s.writeData(proof, "proof"); err != nil {
-		return blockLocation{}, err
-	}
-	_, _ = hasher.Write(proof)
-
-	// Castagnoli CRC-32 as a checksum of all the previous.
-	if err := s.writeData(hasher.Sum(nil), "checksum"); err != nil {
-		return blockLocation{}, err
+	if n != len(record) {
+		str := fmt.Sprintf("short write to file %d at offset %d: "+
+			"wrote %d bytes, want %d", blockFileNum, origOffset, n,
+			len(record))
+		return blockLocation{}, makeDbErr(database.ErrDriverSpecific, str, nil)
 	}
 
 	loc := blockLocation{
