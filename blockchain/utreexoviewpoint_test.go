@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/utreexo/utreexo"
+	"github.com/utreexo/utreexod/wire"
 )
 
 func TestChainTipProofSerialize(t *testing.T) {
@@ -84,10 +85,16 @@ func TestUtreexoViewpointCopyWithRoots(t *testing.T) {
 			name: "single-root",
 			setup: func(orig *UtreexoViewpoint) {
 				h := hash("leaf-1")
+				left := hash("left")
+				right := hash("right")
 				orig.accumulator.NumLeaves = 1
 				orig.accumulator.TotalRows = 1
 				orig.accumulator.Roots = []utreexo.Hash{h}
-				orig.accumulator.Nodes.Put(h, utreexo.Node{AddIndex: 5})
+				orig.accumulator.Nodes.Put(h, utreexo.Node{
+					LBelow:   left,
+					RBelow:   right,
+					AddIndex: 5,
+				})
 				setAgg(orig, 1)
 			},
 		},
@@ -129,8 +136,10 @@ func TestUtreexoViewpointCopyWithRoots(t *testing.T) {
 			require.Equal(t, orig.agg, copyView.agg, "aggregator mismatch")
 
 			for _, root := range copyView.accumulator.Roots {
-				_, ok := copyView.accumulator.Nodes.Get(root)
+				node, ok := copyView.accumulator.Nodes.Get(root)
 				require.Truef(t, ok, "missing node for root %x", root[:])
+				require.Equal(t, utreexo.Node{AddIndex: -1}, node,
+					"root node is not a parent of any cached children")
 			}
 
 			expectedRoots := append([]utreexo.Hash(nil), copyView.accumulator.Roots...)
@@ -144,4 +153,38 @@ func TestUtreexoViewpointCopyWithRoots(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCopyWithRootsAppliesProof ensures a copy built by CopyWithRoots can
+// still ingest and apply a proof. The copy holds only the roots, so the
+// proof must carry every sibling hash needed to rebuild the deletion path.
+func TestCopyWithRootsAppliesProof(t *testing.T) {
+	t.Parallel()
+
+	// Build an accumulator with enough leaves that the roots have cached
+	// children below them.
+	orig := NewUtreexoViewpoint()
+	leaves := make([]utreexo.Leaf, 4)
+	for i := range leaves {
+		h := sha256.Sum256([]byte{byte(i)})
+		leaves[i] = utreexo.Leaf{Hash: utreexo.Hash(h), Remember: true}
+	}
+	_, err := orig.Modify(&wire.UData{}, leaves, nil)
+	require.NoError(t, err, "Modify to seed accumulator")
+
+	// Prove a deletion against the original, which still holds the full
+	// cached tree.
+	delHashes := []utreexo.Hash{leaves[0].Hash}
+	proof, err := orig.accumulator.Prove(delHashes)
+	require.NoError(t, err, "Prove deletion against original")
+
+	// Apply the proof to a roots-only copy. The proof carries every sibling
+	// hash needed to rebuild the deletion path.
+	copyView := orig.CopyWithRoots()
+	err = copyView.accumulator.Verify(delHashes, proof, false)
+	require.NoError(t, err, "Verify proof on copy")
+	err = copyView.accumulator.Ingest(delHashes, proof)
+	require.NoError(t, err, "Ingest proof on copy")
+	err = copyView.accumulator.Modify(nil, delHashes, proof)
+	require.NoError(t, err, "Modify copy with proof")
 }
