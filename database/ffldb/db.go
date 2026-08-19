@@ -1978,14 +1978,11 @@ func (tx *transaction) FetchSpendJournal(hash *chainhash.Hash) ([]byte, error) {
 }
 
 // StoreUtreexoProof stores the provided serialized utreexo proof for the block
-// identified by blockHash in the flat-file proof store.  It is written
-// atomically with the transaction and rolled back if the transaction does not
-// commit.  A validated proof for a given block never changes, so the store is
-// effectively write-once per hash.
+// identified by blockHash in the flat-file proof store.  Its index entry is
+// committed atomically with the transaction.  A validated proof for a given
+// block never changes, so the store is effectively write-once per hash.
 //
-// Proof files are partitioned by their corresponding block file number.  Since
-// the flat-file rollback metadata describes a single monotonic write cursor, a
-// commit that attempts to backfill a proof in an older block file will fail.
+// Proof files are partitioned by their corresponding block file number.
 //
 // The interface contract guarantees at least the following errors will be
 // returned (other implementation-specific errors are possible):
@@ -2003,6 +2000,20 @@ func (tx *transaction) StoreUtreexoProof(blockHash *chainhash.Hash, proof []byte
 	if !tx.writable {
 		str := "store utreexo proof requires a writable database transaction"
 		return makeDbErr(database.ErrTxNotWritable, str, nil)
+	}
+
+	existing, err := tx.FetchUtreexoProof(blockHash)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if bytes.Equal(existing, proof) {
+			return nil
+		}
+
+		str := fmt.Sprintf("utreexo proof for block %s already exists "+
+			"with different data", blockHash)
+		return makeDbErr(database.ErrDriverSpecific, str, nil)
 	}
 
 	// Ensure the proof index bucket exists.  It is created lazily as a normal
