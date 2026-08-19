@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -355,6 +356,11 @@ func (s *blockStore) fileSize(fileNum uint32) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
+	if st.Size() > int64(math.MaxUint32) {
+		str := fmt.Sprintf("flat file %d is too large: %d bytes", fileNum,
+			st.Size())
+		return 0, makeDbErr(database.ErrDriverSpecific, str, nil)
+	}
 
 	return uint32(st.Size()), nil
 }
@@ -457,11 +463,11 @@ func (s *blockStore) writeData(data []byte, fieldName string) error {
 func (s *blockStore) appendProof(proof []byte,
 	blockFileNum uint32) (blockLocation, error) {
 
-	const maxUint32 = uint64(^uint32(0))
 	recordLen := uint64(len(proof)) + 12
-	if recordLen > maxUint32 {
+	if recordLen > uint64(math.MaxUint32) {
 		str := fmt.Sprintf("serialized data is too large for a flat-file "+
-			"record: got %d bytes, maximum is %d", recordLen, maxUint32)
+			"record: got %d bytes, maximum is %d", recordLen,
+			uint64(math.MaxUint32))
 		return blockLocation{}, makeDbErr(database.ErrDriverSpecific, str, nil)
 	}
 	record := s.serializeBlockRecord(proof)
@@ -474,6 +480,13 @@ func (s *blockStore) appendProof(proof []byte,
 		fileOffset, err := s.fileSizeFunc(blockFileNum)
 		if err != nil && !os.IsNotExist(err) {
 			return blockLocation{}, err
+		}
+		if uint64(fileOffset)+recordLen > uint64(math.MaxUint32) {
+			str := fmt.Sprintf("flat file %d offset overflows uint32: "+
+				"offset %d plus record length %d", blockFileNum,
+				fileOffset, recordLen)
+			return blockLocation{}, makeDbErr(database.ErrDriverSpecific,
+				str, nil)
 		}
 
 		file, err := s.openWriteFileFunc(blockFileNum)
@@ -525,7 +538,7 @@ func (s *blockStore) appendProof(proof []byte,
 	if err != nil {
 		return blockLocation{}, err
 	}
-	if uint64(fileOffset)+recordLen > maxUint32 {
+	if uint64(fileOffset)+recordLen > uint64(math.MaxUint32) {
 		str := fmt.Sprintf("flat file %d offset overflows uint32: "+
 			"offset %d plus record length %d", blockFileNum, fileOffset,
 			recordLen)
