@@ -959,3 +959,130 @@ func TestOverWrite(t *testing.T) {
 		}
 	}
 }
+
+// TestRecoverResetsCurrentOffset truncates the second record's header and
+// reopens the index. Recovery must position the next write at the end of the
+// surviving first record, which must remain intact after storing a replacement.
+func TestRecoverResetsCurrentOffset(t *testing.T) {
+	dir := t.TempDir()
+	ff := NewFlatFileState()
+	if err := ff.Init(dir, "recover-offset"); err != nil {
+		t.Fatal(err)
+	}
+
+	first := []byte("first record remains intact")
+	second := []byte("second record is truncated")
+	if err := ff.StoreData(1, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := ff.StoreData(2, second); err != nil {
+		t.Fatal(err)
+	}
+	firstEnd := int64(8 + len(first))
+	if err := ff.dataFile.Truncate(firstEnd + 4); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := NewFlatFileState()
+	if err := reopened.Init(dir, "recover-offset"); err != nil {
+		t.Fatal(err)
+	}
+	if reopened.currentHeight != 1 {
+		t.Fatalf("recovered height: got %d, want 1", reopened.currentHeight)
+	}
+	if reopened.currentOffset != firstEnd {
+		t.Fatalf("recovered offset: got %d, want %d", reopened.currentOffset, firstEnd)
+	}
+
+	replacement := []byte("replacement second record")
+	if err := reopened.StoreData(2, replacement); err != nil {
+		t.Fatal(err)
+	}
+	got, err := reopened.FetchData(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, first, got)
+}
+
+// TestOverWriteRejectsRecordBoundary attempts a write that starts inside the
+// first record's payload but extends into the next record's header. The write
+// must fail and leave the next record readable and unchanged.
+func TestOverWriteRejectsRecordBoundary(t *testing.T) {
+	dir := t.TempDir()
+	ff := NewFlatFileState()
+	if err := ff.Init(dir, "overwrite-boundary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ff.StoreData(1, make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ff.StoreData(2, []byte("next record")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ff.OverWrite(1, 4, make([]byte, 8))
+	if err == nil {
+		t.Fatal("expected overwrite crossing the record boundary to fail")
+	}
+	got, fetchErr := ff.FetchData(2)
+	if fetchErr != nil {
+		t.Fatal(fetchErr)
+	}
+	require.Equal(t, []byte("next record"), got)
+}
+
+// TestRecoverEmptyThenAppend truncates the only record so recovery removes it.
+// The next store must start at byte zero and be readable through its new offset.
+func TestRecoverEmptyThenAppend(t *testing.T) {
+	dir := t.TempDir()
+	ff := NewFlatFileState()
+	require.NoError(t, ff.Init(dir, "empty"))
+	require.NoError(t, ff.StoreData(1, []byte("incomplete")))
+	require.NoError(t, ff.dataFile.Truncate(4))
+	require.NoError(t, ff.dataFile.Close())
+	require.NoError(t, ff.offsetFile.Close())
+
+	ff = NewFlatFileState()
+	require.NoError(t, ff.Init(dir, "empty"))
+	t.Cleanup(func() { ff.dataFile.Close(); ff.offsetFile.Close() })
+	require.Equal(t, int32(0), ff.BestHeight())
+	require.Equal(t, int64(0), ff.currentOffset)
+	require.NoError(t, ff.StoreData(1, []byte("replacement")))
+	require.Equal(t, int64(0), ff.offsets[1])
+	got, err := ff.FetchData(1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("replacement"), got)
+}
+
+// TestOverWriteRejectsZeroOffset redirects the second record's offset to the
+// first record. Even though the destination has valid framing and enough room,
+// the write must fail without changing the first record's payload.
+func TestOverWriteRejectsZeroOffset(t *testing.T) {
+	ff := NewFlatFileState()
+	require.NoError(t, ff.Init(t.TempDir(), "zero-offset"))
+	t.Cleanup(func() { ff.dataFile.Close(); ff.offsetFile.Close() })
+	require.NoError(t, ff.StoreData(1, []byte("original")))
+	require.NoError(t, ff.StoreData(2, make([]byte, 8)))
+	ff.offsets[2] = 0
+	require.Error(t, ff.OverWrite(2, 0, []byte("corrupt!")))
+	got, err := ff.FetchData(1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("original"), got)
+}
+
+// TestStoreFailureDoesNotPublishOffset closes the data file to force a store
+// failure. Neither the offset table nor the in-memory height and offsets may
+// advance to reference the unwritten record.
+func TestStoreFailureDoesNotPublishOffset(t *testing.T) {
+	ff := NewFlatFileState()
+	require.NoError(t, ff.Init(t.TempDir(), "failed-store"))
+	t.Cleanup(func() { ff.offsetFile.Close() })
+	require.NoError(t, ff.dataFile.Close())
+	require.Error(t, ff.StoreData(1, []byte("unwritten")))
+	require.Equal(t, int32(0), ff.BestHeight())
+	require.Len(t, ff.offsets, 1)
+	info, err := ff.offsetFile.Stat()
+	require.NoError(t, err)
+	require.Equal(t, int64(8), info.Size())
+}

@@ -86,6 +86,14 @@ func (ff *FlatFileState) recover() error {
 			if err == nil && uint32(read) == size {
 				_, err := ff.FetchData(ff.currentHeight)
 				if err == nil {
+					// The next write must start immediately after the last
+					// readable record.  In particular, do not retain the offset
+					// from a corrupt entry that was removed below.
+					ff.currentOffset = offset + 8 + int64(size)
+					if err := ff.dataFile.Truncate(ff.currentOffset); err != nil {
+						return err
+					}
+
 					// If we're able to read the data bytes, then return here.
 					return nil
 				}
@@ -115,14 +123,14 @@ func (ff *FlatFileState) recover() error {
 			return err
 		}
 
-		// Set the currentOffset as the last offset.
-		ff.currentOffset = ff.offsets[len(ff.offsets)-1]
-
 		// Pop the offset in memory.
 		ff.offsets = ff.offsets[:len(ff.offsets)-1]
 	}
 
-	return nil
+	// No record survived. Reset the append cursor as well as the file so a
+	// subsequent store cannot leave a hole at the beginning of the index.
+	ff.currentOffset = 0
+	return ff.dataFile.Truncate(0)
 }
 
 // Init initializes the FlatFileState.  If resuming, it loads the offsets onto memory.
@@ -242,13 +250,6 @@ func (ff *FlatFileState) StoreData(height int32, data []byte) error {
 	// keeps no reusable scratch on the struct.
 	var buf [8]byte
 
-	// Encode the offset and write it to the offset file.
-	ff.offsets = append(ff.offsets, ff.currentOffset)
-	binary.BigEndian.PutUint64(buf[:], uint64(ff.currentOffset))
-	if _, err := ff.offsetFile.WriteAt(buf[:], int64(height)*8); err != nil {
-		return err
-	}
-
 	// Write the magic and size header, then the data itself, to the data
 	// file at adjacent offsets. FetchData reads them back as the same two
 	// pieces, and writing the data straight through avoids copying it into
@@ -261,6 +262,16 @@ func (ff *FlatFileState) StoreData(height int32, data []byte) error {
 	if _, err := ff.dataFile.WriteAt(data, ff.currentOffset+8); err != nil {
 		return err
 	}
+
+	// Publish the offset only after the complete framed record has been
+	// written. This avoids publishing a record after a failed data write.
+	// Write ordering alone does not guarantee persistence ordering; callers
+	// must also sync the files at their durability boundary.
+	binary.BigEndian.PutUint64(buf[:], uint64(ff.currentOffset))
+	if _, err := ff.offsetFile.WriteAt(buf[:], int64(height)*8); err != nil {
+		return err
+	}
+	ff.offsets = append(ff.offsets, ff.currentOffset)
 
 	// Increment the current offset.  +8 to account for the magic bytes and size.
 	ff.currentOffset += int64(len(data)) + 8
@@ -291,9 +302,32 @@ func (ff *FlatFileState) overwriteLocked(height, offset int32, data []byte) erro
 
 	// Grab the offset for where the data is in the dataFile.
 	fOffset := ff.offsets[height]
+	// Only the first stored record can start at byte zero. Reject a zero
+	// offset for later heights so a corrupt lookup cannot overwrite it.
+	if fOffset < 0 || (height > 1 && fOffset == 0) {
+		return fmt.Errorf("cannot overwrite height %d: invalid record offset %d", height, fOffset)
+	}
+	// Validate the destination's framing before using its declared payload
+	// size to bound the write.
+	header := make([]byte, 8)
+	_, err := ff.dataFile.ReadAt(header, fOffset)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(header[:4], magicBytes[:]) {
+		return fmt.Errorf("cannot overwrite height %d: read wrong magic of %x",
+			height, header[:4])
+	}
+	// Keep the entire write inside the payload; an unchecked TTL offset could
+	// otherwise overwrite this record's header or the following record.
+	recordSize := int64(binary.BigEndian.Uint32(header[4:]))
+	if offset < 0 || int64(offset)+int64(len(data)) > recordSize {
+		return fmt.Errorf("overwrite outside height %d record: offset %d, size %d, record size %d",
+			height, offset, len(data), recordSize)
+	}
 	writeOffset := fOffset + 8 + int64(offset)
 
-	_, err := ff.dataFile.WriteAt(data, writeOffset)
+	_, err = ff.dataFile.WriteAt(data, writeOffset)
 	return err
 }
 
