@@ -443,6 +443,17 @@ func (ff *FlatFileState) BestHeight() int32 {
 	return ff.currentHeight
 }
 
+// Sync flushes record data before its offset table. Callers must coordinate
+// external database commits separately; this is not a multi-file transaction.
+func (ff *FlatFileState) Sync() error {
+	ff.mtx.Lock()
+	defer ff.mtx.Unlock()
+	if err := ff.dataFile.Sync(); err != nil {
+		return err
+	}
+	return ff.offsetFile.Sync()
+}
+
 // deleteFileFile removes the flat file state directory and all the contents
 // in it.
 func deleteFlatFile(path string) error {
