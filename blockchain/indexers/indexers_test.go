@@ -3,6 +3,7 @@ package indexers
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -1385,6 +1386,99 @@ func TestTTLs(t *testing.T) {
 
 	checkTTLRoots(t, maxHeight, expectedStumps, indexes)
 	checkTTLsAfterUndo(t, expectAfterUndoTTLs, indexes, chain)
+}
+
+// TestIndexFlushFailurePreservesConnectedState checks that a committed block
+// stays connected and is notified even when flushing its indexes fails.
+func TestIndexFlushFailurePreservesConnectedState(t *testing.T) {
+	// Boilerplate setup: create a chain with a utreexo proof index.
+	setup := func(t *testing.T) (*blockchain.BlockChain, *UtreexoProofIndex, *btcutil.Block) {
+		t.Helper()
+		params := chaincfg.RegressionNetParams
+
+		dbPath := t.TempDir()
+		db, err := database.Create(testDbType, dbPath, blockDataNet)
+		require.NoError(t, err)
+		t.Cleanup(func() { db.Close() })
+
+		// A one byte cache budget makes each block require an index flush.
+		idx, err := NewUtreexoProofIndex(db, false, 1, &params, dbPath, db.Flush)
+		require.NoError(t, err)
+		chain, err := blockchain.New(&blockchain.Config{
+			DB:               db,
+			ChainParams:      &params,
+			TimeSource:       blockchain.NewMedianTime(),
+			SigCache:         txscript.NewSigCache(1000),
+			UtxoCacheMaxSize: 10 * 1024 * 1024,
+			IndexManager:     NewManager(db, []Indexer{idx}),
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { idx.CloseUtreexoState() })
+
+		prev := btcutil.NewBlock(params.GenesisBlock)
+		prev.SetHeight(0)
+		block, _ := blockchain.NewBlock(chain, prev, nil)
+		return chain, idx, block
+	}
+
+	tests := []struct {
+		name  string
+		setup func(*testing.T) (*blockchain.BlockChain, *UtreexoProofIndex, *btcutil.Block)
+		err   error
+	}{
+		{name: "flush error", setup: setup, err: errors.New("index flush failure")},
+		{name: "database corruption", setup: setup, err: database.Error{
+			ErrorCode: database.ErrCorruption, Description: "index corruption",
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			chain, idx, block := test.setup(t)
+
+			// Test setup: check connected state and inject a flush failure.
+			var notifications []blockchain.NotificationType
+			chain.Subscribe(func(notification *blockchain.Notification) {
+				notifications = append(notifications, notification.Type)
+			})
+			checkState := func() {
+				t.Helper()
+
+				// The snapshot and main chain must already reflect the committed block.
+				state := chain.BestSnapshot()
+				require.Equal(t, *block.Hash(), state.Hash)
+				require.Equal(t, block.Height(), state.Height)
+				require.True(t, chain.MainChainHasBlock(block.Hash()))
+
+				// The indexer tip in the database must match the published snapshot.
+				var tipHash *chainhash.Hash
+				var tipHeight int32
+				err := idx.db.View(func(dbTx database.Tx) error {
+					var err error
+					tipHash, tipHeight, err = dbFetchIndexerTip(dbTx, idx.Key())
+					return err
+				})
+				require.NoError(t, err)
+				require.Equal(t, state.Hash, *tipHash)
+				require.Equal(t, state.Height, tipHeight)
+			}
+			idx.config.FlushMainDB = func() error {
+				checkState()
+				require.Empty(t, notifications)
+				return test.err
+			}
+
+			// Test: the flush error reaches the caller after the committed
+			// block's state and notification are published.
+			_, _, err := chain.ProcessBlock(block, blockchain.BFNone)
+			require.Equal(t, test.err, err)
+			checkState()
+
+			// Subscribers must receive NTBlockConnected before the flush error is returned.
+			require.Equal(t, []blockchain.NotificationType{
+				blockchain.NTBlockConnected,
+			}, notifications)
+		})
+	}
 }
 
 func TestBridgeNodeSSTableFlush(t *testing.T) {
