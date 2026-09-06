@@ -34,21 +34,15 @@ type UtreexoViewpoint struct {
 	agg aggregator.Agg512
 }
 
-// CopyWithRoots returns a new utreexo viewpoint with just the roots copied.
+// CopyWithRoots returns a new utreexo viewpoint that holds only the
+// accumulator roots. The result is a plain stump with no cached internal
+// nodes, so any caller that advances the accumulator must supply a proof
+// that carries the needed sibling hashes, as VerifyUData and ProcessUData
+// do. PruneAll intentionally keeps only the roots.
 func (uview *UtreexoViewpoint) CopyWithRoots() *UtreexoViewpoint {
 	newUview := NewUtreexoViewpoint()
-	newUview.accumulator.NumLeaves = uview.accumulator.NumLeaves
+	newUview.accumulator = *utreexo.InitWithStump(uview.accumulator.GetStump())
 	newUview.accumulator.TotalRows = uview.accumulator.TotalRows
-
-	roots := uview.accumulator.GetRoots()
-	nodes := uview.accumulator.GetRootNodes()
-
-	newUview.accumulator.Roots = make([]utreexo.Hash, len(roots))
-	for i := range roots {
-		newUview.accumulator.Roots[i] = roots[i]
-		newUview.accumulator.Nodes.Put(roots[i], nodes[i])
-	}
-
 	newUview.agg = uview.agg
 	return newUview
 }
