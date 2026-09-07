@@ -776,14 +776,6 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		return err
 	}
 
-	// Flush the indexes if they need to be flushed.
-	if b.indexManager != nil {
-		err := b.indexManager.Flush(&state.Hash, FlushIfNeeded, true)
-		if err != nil {
-			return err
-		}
-	}
-
 	// Prune fully spent entries and mark all entries in the view unmodified
 	// now that the modifications have been committed to the database.
 	if view != nil {
@@ -802,12 +794,26 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	b.stateSnapshot = state
 	b.stateLock.Unlock()
 
+	// Flush while holding the chain lock so the indexes still correspond to
+	// state.Hash. Save any error until after notifying subscribers because
+	// the block is already committed and published.
+	// TODO: Determine which index flush errors can be retried safely and
+	// which require stopping block processing.
+	var flushErr error
+	if b.indexManager != nil {
+		flushErr = b.indexManager.Flush(&state.Hash, FlushIfNeeded, true)
+	}
+
 	// Notify the caller that the block was connected to the main chain.
 	// The caller would typically want to react with actions such as
 	// updating wallets.
 	b.chainLock.Unlock()
 	b.sendNotification(NTBlockConnected, block)
 	b.chainLock.Lock()
+
+	if flushErr != nil {
+		return flushErr
+	}
 
 	// Don't try to flush the utxo set if we're a utreexo node.
 	if b.utreexoView == nil {
