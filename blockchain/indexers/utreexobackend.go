@@ -200,6 +200,23 @@ func (idx *FlatUtreexoProofIndex) Flush(bestHash *chainhash.Hash, mode blockchai
 	}
 
 	if onConnect {
+		// Sync flat records before this explicit main database flush. This does
+		// not cover independent database flushes or make the files transactional.
+		states := []*FlatFileState{
+			&idx.undoState,
+			&idx.proofStatsState,
+			&idx.rootsState,
+		}
+		if !idx.config.Pruned {
+			states = append(states, &idx.targetState, &idx.proofState,
+				&idx.leafDataState, &idx.ttlState)
+		}
+		for _, state := range states {
+			if err := state.Sync(); err != nil {
+				return err
+			}
+		}
+
 		// Flush the main database first. This is because the block and other data may still
 		// be in the database cache. If we flush the utreexo state before, there's no way to
 		// undo the utreexo state to the last block where the main database flushed. Flushing
