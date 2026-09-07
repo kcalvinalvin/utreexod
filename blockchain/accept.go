@@ -46,6 +46,13 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		return false, err
 	}
 
+	// Reject missing proof data before storage so the block can be submitted
+	// again with its Utreexo data.
+	if b.utreexoView != nil && block.UtreexoData() == nil {
+		return false, fmt.Errorf("utreexo viewpoint is active but no "+
+			"utreexo proof data was included in block %s", block.Hash())
+	}
+
 	// Insert the block into the database if it's not already there.  Even
 	// though it is possible the block will ultimately fail to connect, it
 	// has already passed all proof-of-work and validity tests which means

@@ -246,18 +246,18 @@ func assertStoredUtreexoProof(t *testing.T, chain *BlockChain,
 	err := block.UtreexoData().Serialize(&want)
 	require.NoError(t, err, "Serialize udata for %s", block.Hash())
 
+	var got []byte
 	err = chain.db.View(func(dbTx database.Tx) error {
-		got, err := dbTx.FetchUtreexoProof(block.Hash())
-		if err != nil {
-			return err
-		}
-		require.NotNil(t, got, "no stored utreexo proof for %s",
-			block.Hash())
-		require.Equal(t, want.Bytes(), got, "stored utreexo proof "+
-			"mismatch for %s", block.Hash())
-		return nil
+		proof, err := dbTx.FetchUtreexoProof(block.Hash())
+		// The fetched bytes are only valid while the transaction is open.
+		got = bytes.Clone(proof)
+		return err
 	})
 	require.NoError(t, err, "FetchUtreexoProof")
+	require.NotNil(t, got, "no stored utreexo proof for %s",
+		block.Hash())
+	require.Equal(t, want.Bytes(), got, "stored utreexo proof "+
+		"mismatch for %s", block.Hash())
 }
 
 // assertNoStoredUtreexoProof ensures the block has no proof in the store.
@@ -449,6 +449,90 @@ func TestInvalidUtreexoProofIsNotStored(t *testing.T) {
 	_, _, err := chain.ProcessBlock(block, BFNone)
 	require.Error(t, err, "ProcessBlock accepted an invalid utreexo proof")
 	assertNoStoredUtreexoProof(t, chain, block)
+}
+
+// TestMissingUtreexoDataIsNotStored ensures missing Utreexo data is rejected
+// before storage so the block can be retried with its proof.
+func TestMissingUtreexoDataIsNotStored(t *testing.T) {
+	tests := []struct {
+		name      string
+		flags     BehaviorFlags
+		ttls      bool
+		sideChain bool
+	}{
+		{name: "main chain"},
+		{name: "fast add with ttls", flags: BFFastAdd, ttls: true},
+		{name: "side chain", sideChain: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Boilerplate setup: create a compact-state chain and candidate block.
+			chain, params, _, tearDown := countingUtreexoTestChain(t,
+				"missing-udata")
+			defer tearDown()
+
+			genesis := btcutil.NewBlock(params.GenesisBlock)
+			genesis.SetHeight(0)
+			proofState := newTestUtreexoProofState()
+			prev := genesis
+			var spends []wire.LeafData
+			if test.sideChain {
+				prev, spends = proofState.newBlock(t, chain, genesis, nil)
+				processBlock(t, chain, prev, true)
+				mainProofState := &testUtreexoProofState{
+					uView: proofState.uView.CopyWithRoots(),
+				}
+				mainBlock, _ := mainProofState.newBlock(t, chain, prev, nil)
+				processBlock(t, chain, mainBlock, true)
+			}
+			block, _ := proofState.newBlock(t, chain, prev, spends)
+			if test.ttls {
+				block.SetUtreexoTTLs(&wire.UtreexoTTL{
+					BlockHeight: uint32(block.Height()),
+					TTLs:        make([]wire.TTLInfo, len(ExtractAccumulatorAdds(block))),
+				})
+			}
+			udata := block.UtreexoData()
+			block.SetUtreexoData(nil)
+
+			tipBefore := chain.bestChain.Tip().hash
+			rootsBefore := append([]utreexo.Hash(nil),
+				chain.utreexoView.accumulator.GetRoots()...)
+			leavesBefore := chain.utreexoView.NumLeaves()
+			aggBefore := chain.utreexoView.agg
+
+			// Test: missing proof data must leave the chain and database unchanged.
+			_, _, err := chain.ProcessBlock(block, test.flags)
+			require.Error(t, err)
+			require.Equal(t, tipBefore, chain.bestChain.Tip().hash)
+			require.True(t, chain.utreexoView.compareRoots(rootsBefore))
+			require.Equal(t, leavesBefore, chain.utreexoView.NumLeaves())
+			require.Equal(t, aggBefore, chain.utreexoView.agg)
+
+			var hasBlock bool
+			var proof []byte
+			err = chain.db.View(func(dbTx database.Tx) error {
+				var err error
+				hasBlock, err = dbTx.HasBlock(block.Hash())
+				if err != nil {
+					return err
+				}
+				proof, err = dbTx.FetchUtreexoProof(block.Hash())
+				return err
+			})
+			require.NoError(t, err)
+			require.False(t, hasBlock, "block stored without utreexo data")
+			require.Nil(t, proof)
+
+			// The complete block must still be accepted on its intended chain.
+			block.SetUtreexoData(udata)
+			isMainChain, isOrphan, err := chain.ProcessBlock(block, test.flags)
+			require.NoError(t, err)
+			require.False(t, isOrphan)
+			require.Equal(t, !test.sideChain, isMainChain)
+			assertStoredUtreexoProof(t, chain, block)
+		})
+	}
 }
 
 // TestStoreMainChainUtreexoProof ensures a main-chain proof is stored once.
